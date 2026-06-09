@@ -1,11 +1,6 @@
-## My Project
+## EKS User Guide Samples
 
-TODO: Fill this README out!
-
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+This repository contains code samples used in the [EKS User Guide](https://docs.aws.amazon.com/eks/latest/userguide/ml-on-eks.html).
 
 ## Security
 
