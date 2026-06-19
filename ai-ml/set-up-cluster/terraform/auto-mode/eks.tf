@@ -1,4 +1,6 @@
 locals {
+  name = var.cluster_name
+
   # Auto Mode bundles vpc-cni, kube-proxy, coredns, ebs-csi, pod-identity-agent, eks-node-monitoring-agent.
   # metrics-server isn't bundled and is installed as a standalone addon.
   standalone_addons = {
@@ -17,7 +19,7 @@ module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "21.20.0"
 
-  name               = var.cluster_name
+  name               = local.name
   kubernetes_version = var.kubernetes_version
 
   vpc_id                   = module.vpc.vpc_id

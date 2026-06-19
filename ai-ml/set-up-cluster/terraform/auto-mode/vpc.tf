@@ -31,7 +31,7 @@ module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "6.6.1"
 
-  name = var.cluster_name
+  name = local.name
   cidr = local.vpc_cidr
   azs  = local.azs
 
@@ -46,14 +46,14 @@ module "vpc" {
 
   private_subnet_tags = {
     "kubernetes.io/role/internal-elb" = 1
-    "karpenter.sh/discovery"          = var.cluster_name
+    "karpenter.sh/discovery"          = local.name
   }
 }
 
 resource "aws_nat_gateway" "regional" {
   vpc_id            = module.vpc.vpc_id
   availability_mode = "regional"
-  tags              = { Name = "${var.cluster_name}-ngw" }
+  tags              = { Name = "${local.name}-ngw" }
 
   depends_on = [module.vpc]
 }
@@ -66,14 +66,14 @@ resource "aws_route" "private_ngw" {
 }
 
 resource "aws_security_group" "shared" {
-  name        = "${var.cluster_name}-shared"
+  name        = "${local.name}-shared"
   description = "Intra-VPC shared SG; self-ingress + all egress."
   vpc_id      = module.vpc.vpc_id
 
   tags = {
-    Name                                           = "${var.cluster_name}-shared"
-    "karpenter.sh/discovery"                       = var.cluster_name
-    "kubernetes.io/cluster/${var.cluster_name}" = "owned"
+    Name                                           = "${local.name}-shared"
+    "karpenter.sh/discovery"                       = local.name
+    "kubernetes.io/cluster/${local.name}" = "owned"
   }
 }
 
@@ -103,7 +103,7 @@ module "vpc_endpoints" {
       service         = "s3"
       service_type    = "Gateway"
       route_table_ids = module.vpc.private_route_table_ids
-      tags            = { Name = "${var.cluster_name}-s3" }
+      tags            = { Name = "${local.name}-s3" }
     }
 
     guardduty_data = {
@@ -111,7 +111,7 @@ module "vpc_endpoints" {
       service_type        = "Interface"
       private_dns_enabled = true
       subnet_ids          = module.vpc.private_subnets
-      tags                = { Name = "${var.cluster_name}-guardduty-data" }
+      tags                = { Name = "${local.name}-guardduty-data" }
     }
   }
 }
