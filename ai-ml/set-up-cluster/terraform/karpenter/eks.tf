@@ -1,4 +1,6 @@
 locals {
+  name = var.cluster_name
+
   module_addons = {
     eks-pod-identity-agent = {
       before_compute = true
@@ -70,7 +72,7 @@ module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "21.20.0"
 
-  name               = var.cluster_name
+  name               = local.name
   kubernetes_version = var.kubernetes_version
 
   vpc_id                   = module.vpc.vpc_id
@@ -175,7 +177,7 @@ data "aws_iam_policy_document" "pod_identity_assume" {
 }
 
 resource "aws_iam_role" "vpc_cni" {
-  name               = "${var.cluster_name}-vpc-cni"
+  name               = "${local.name}-vpc-cni"
   assume_role_policy = data.aws_iam_policy_document.pod_identity_assume.json
 }
 
@@ -185,7 +187,7 @@ resource "aws_iam_role_policy_attachment" "vpc_cni" {
 }
 
 resource "aws_iam_role" "ebs_csi" {
-  name               = "${var.cluster_name}-ebs-csi-controller"
+  name               = "${local.name}-ebs-csi-controller"
   assume_role_policy = data.aws_iam_policy_document.pod_identity_assume.json
 }
 

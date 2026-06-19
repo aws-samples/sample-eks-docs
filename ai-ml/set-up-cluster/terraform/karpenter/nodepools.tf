@@ -8,7 +8,7 @@ resource "kubectl_manifest" "nodeclasses" {
   for_each = fileset(local.nodepools_manifests_path, "nodeclass-*.yml")
 
   yaml_body = templatefile("${local.nodepools_manifests_path}/${each.value}", {
-    cluster_name       = var.cluster_name
+    cluster_name       = local.name
     node_iam_role_name = module.karpenter.node_iam_role_name
   })
 

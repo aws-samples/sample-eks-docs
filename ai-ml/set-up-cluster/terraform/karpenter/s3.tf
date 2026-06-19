@@ -4,7 +4,7 @@ locals {
 }
 
 resource "aws_s3_bucket" "models" {
-  bucket_prefix = "${var.cluster_name}-models-"
+  bucket_prefix = "${local.name}-models-"
   force_destroy = true
 }
 
@@ -17,12 +17,12 @@ resource "aws_s3_bucket_public_access_block" "models" {
 }
 
 resource "aws_iam_role" "models" {
-  name_prefix        = "${var.cluster_name}-models-"
+  name_prefix        = "${local.name}-models-"
   assume_role_policy = data.aws_iam_policy_document.pod_identity_assume.json
 }
 
 resource "aws_iam_role_policy" "models" {
-  name_prefix = "${var.cluster_name}-models-"
+  name_prefix = "${local.name}-models-"
   role        = aws_iam_role.models.id
 
   policy = jsonencode({

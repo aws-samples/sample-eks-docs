@@ -11,7 +11,7 @@ locals {
 resource "aws_prometheus_workspace" "amp" {
   count = var.enable_amazon_prometheus ? 1 : 0
 
-  alias = var.cluster_name
+  alias = local.name
 }
 
 data "aws_iam_policy_document" "amp_remote_write" {
@@ -27,14 +27,14 @@ data "aws_iam_policy_document" "amp_remote_write" {
 resource "aws_iam_policy" "amp_remote_write" {
   count = var.enable_amazon_prometheus ? 1 : 0
 
-  name   = "${var.cluster_name}-amp-remote-write"
+  name   = "${local.name}-amp-remote-write"
   policy = data.aws_iam_policy_document.amp_remote_write[0].json
 }
 
 resource "aws_iam_role" "amp_remote_write" {
   count = var.enable_amazon_prometheus ? 1 : 0
 
-  name               = "${var.cluster_name}-amp-remote-write"
+  name               = "${local.name}-amp-remote-write"
   assume_role_policy = data.aws_iam_policy_document.pod_identity_assume.json
 }
 
@@ -77,14 +77,14 @@ data "aws_iam_policy_document" "amp_query" {
 resource "aws_iam_policy" "amp_query" {
   count = var.enable_amazon_prometheus ? 1 : 0
 
-  name   = "${var.cluster_name}-amp-query"
+  name   = "${local.name}-amp-query"
   policy = data.aws_iam_policy_document.amp_query[0].json
 }
 
 resource "aws_iam_role" "grafana" {
   count = var.enable_amazon_prometheus ? 1 : 0
 
-  name               = "${var.cluster_name}-grafana"
+  name               = "${local.name}-grafana"
   assume_role_policy = data.aws_iam_policy_document.pod_identity_assume.json
 }
 

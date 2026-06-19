@@ -5,8 +5,8 @@ module "karpenter" {
   cluster_name = module.eks.cluster_name
   namespace    = "kube-system"
 
-  iam_role_name      = "${var.cluster_name}-karpenter-controller"
-  node_iam_role_name = "${var.cluster_name}-karpenter-node"
+  iam_role_name      = "${local.name}-karpenter-controller"
+  node_iam_role_name = "${local.name}-karpenter-node"
 
   # Bundled controller policy exceeds the 6144-char managed-policy limit — inline policies allow up to 10240.
   # See https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html.

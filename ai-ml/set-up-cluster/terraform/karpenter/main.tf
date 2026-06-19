@@ -3,7 +3,7 @@ provider "aws" {
 
   default_tags {
     tags = {
-      PartOf    = var.cluster_name
+      PartOf    = local.name
       ManagedBy = "terraform"
     }
   }
