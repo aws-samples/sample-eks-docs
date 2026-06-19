@@ -1,0 +1,22 @@
+# Applied manually (not by Terraform). Substitute the placeholders before applying, e.g.:
+#   export CLUSTER_NAME=$(terraform output -raw cluster_name)
+#   export NODE_IAM_ROLE_NAME=$(terraform output -raw node_iam_role_name)
+#   export CAPACITY_RESERVATION_ID=<capacity-reservation-id>
+#   envsubst < nodeclass-gpu-inf.yml | kubectl apply -f -
+apiVersion: eks.amazonaws.com/v1
+kind: NodeClass
+metadata:
+  name: gpu-inf
+  labels:
+    guide: ai-eks-docs
+spec:
+  role: ${NODE_IAM_ROLE_NAME}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${CLUSTER_NAME}
+        kubernetes.io/role/internal-elb: "1"
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${CLUSTER_NAME}
+  capacityReservationSelectorTerms:
+    - id: ${CAPACITY_RESERVATION_ID}
