@@ -14,4 +14,5 @@ spec:
     - tags:
         karpenter.sh/discovery: ${cluster_name}
   capacityReservationSelectorTerms:
-    - id: ${capacity_reservation_id}
+    - tags:
+        nodepool: reserved-capacity-spot-overflow

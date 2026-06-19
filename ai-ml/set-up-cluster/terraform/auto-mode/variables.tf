@@ -49,39 +49,35 @@ variable "dcgm_exporter_version" {
 
 variable "nodepools" {
   description = <<-EOT
-    GPU NodePool strategies to enable. Each value maps to a folder under nodepools/.
-    Multiple may be enabled as long as their manifest filenames (and thus NodePool/NodeClass names) don't collide.
-    dynamic-spot-on-demand and reserved-capacity-spot-overflow both manage the gpu-inf pool, so they are mutually exclusive.
-    To add a strategy: create nodepools/<name>/ with uniquely-named manifests and add <name> to the validation list below.
+    GPU NodePool strategies to enable, keyed by folder name under nodepools/. Defaults to
+    { "dynamic-spot-on-demand" = {} }. Set `reservation` on a strategy to have Terraform create a
+    tagged On-Demand Capacity Reservation (ODCR) for it; the NodeClass selects it by the
+    nodepool=<key> tag. An ODCR bills immediately until destroyed.
+
+    dynamic-spot-on-demand and reserved-capacity-spot-overflow both manage the gpu-inf pool and are
+    mutually exclusive. To add a strategy: create nodepools/<name>/ and add <name> to the validation list.
   EOT
-  type    = set(string)
-  default = ["dynamic-spot-on-demand"]
+  type = map(object({
+    reservation = optional(object({
+      instance_type  = optional(string, "g6e.4xlarge")
+      instance_count = optional(number, 1)
+      az             = optional(string, "") # defaults to the first cluster AZ
+    }))
+  }))
+  default = { "dynamic-spot-on-demand" = {} }
 
   validation {
     condition = alltrue([
-      for p in var.nodepools : contains([
+      for k in keys(var.nodepools) : contains([
         "dynamic-spot-on-demand",
         "reserved-capacity-spot-overflow",
-      ], p)
+      ], k)
     ])
-    error_message = "Each entry must be an existing strategy folder under nodepools/."
+    error_message = "Each key must be an existing strategy folder under nodepools/."
   }
 
   validation {
-    condition     = !(contains(var.nodepools, "dynamic-spot-on-demand") && contains(var.nodepools, "reserved-capacity-spot-overflow"))
+    condition     = !(contains(keys(var.nodepools), "dynamic-spot-on-demand") && contains(keys(var.nodepools), "reserved-capacity-spot-overflow"))
     error_message = "dynamic-spot-on-demand and reserved-capacity-spot-overflow cannot be enabled together; both manage the gpu-inf NodePool."
   }
-}
-
-variable "reserved_capacity" {
-  description = <<-EOT
-    ODCR parameters, used when reserved-capacity-spot-overflow is enabled. Terraform creates the
-    reservation and wires its id into the NodeClass. Note: an ODCR bills immediately until destroyed.
-  EOT
-  type = object({
-    instance_type  = optional(string, "g6e.4xlarge")
-    instance_count = optional(number, 1)
-    az             = optional(string, "") # defaults to the first cluster AZ
-  })
-  default = {}
 }
