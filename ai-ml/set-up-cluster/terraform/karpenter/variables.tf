@@ -64,3 +64,18 @@ variable "dcgm_exporter_version" {
   type        = string
   default     = "4.8.2"
 }
+
+variable "reserved_capacity" {
+  description = <<-EOT
+    On-Demand Capacity Reservation (ODCR) for reserved-first GPU capacity with spot/on-demand overflow.
+    When enabled, Terraform creates the ODCR and switches the gpu-inf NodePool to the reserved set.
+    Note: an ODCR bills immediately until destroyed (terraform destroy or enabled = false).
+  EOT
+  type = object({
+    enabled        = optional(bool, false)
+    instance_type  = optional(string, "g6e.4xlarge")
+    instance_count = optional(number, 1)
+    az             = optional(string, "") # defaults to the first cluster AZ
+  })
+  default = {}
+}
