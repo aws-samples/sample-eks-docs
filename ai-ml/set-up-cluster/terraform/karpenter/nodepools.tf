@@ -1,12 +1,39 @@
-# The dynamic (spot/on-demand) set is applied by default. Setting reserved_capacity.enabled = true
-# creates an On-Demand Capacity Reservation (ODCR) and switches the gpu-inf NodePool to the
-# reserved set (reserved-first, with spot/on-demand overflow).
+# Which NodePool strategies under nodepools/ are applied is controlled by var.nodepools.
+# Defaults to ["dynamic-spot-on-demand"].
+#
+# Usage:
+#   terraform apply
+#       -> dynamic-spot-on-demand only (default)
+#   terraform apply -var 'nodepools=["reserved-capacity-spot-overflow"]'
+#       -> Terraform creates the ODCR and applies the reserved gpu-inf pool (reserved-first, spot/on-demand
+#          overflow). Defaults to g6e.4xlarge, 1 instance, in the first cluster AZ (azs[0]).
+#   terraform apply -var 'nodepools=["reserved-capacity-spot-overflow"]' -var 'reserved_capacity={instance_type="g6e.4xlarge",instance_count=2}'
+#       -> override ODCR instance type / count / az
+#
+# Notes:
+#   - dynamic-spot-on-demand and reserved-capacity-spot-overflow both manage the gpu-inf pool and
+#     cannot be enabled together (enforced by a validation on var.nodepools).
+
 locals {
-  reserved_enabled         = var.reserved_capacity.enabled
-  nodepools_manifests_path = local.reserved_enabled ? "${path.module}/nodepools/reserved-capacity-spot-overflow" : "${path.module}/nodepools/dynamic-spot-on-demand"
+  nodepools_root   = "${path.module}/nodepools"
+  reserved_enabled = contains(var.nodepools, "reserved-capacity-spot-overflow")
+
+  nodeclass_files = merge([
+    for mode in var.nodepools : {
+      for f in fileset("${local.nodepools_root}/${mode}", "nodeclass-*.yml") :
+      f => "${local.nodepools_root}/${mode}/${f}"
+    }
+  ]...)
+
+  nodepool_files = merge([
+    for mode in var.nodepools : {
+      for f in fileset("${local.nodepools_root}/${mode}", "nodepool-*.yml") :
+      f => "${local.nodepools_root}/${mode}/${f}"
+    }
+  ]...)
 }
 
-# ODCR — bills immediately until destroyed. Created only when reserved_capacity.enabled = true.
+# ODCR — bills immediately until destroyed. Created only when reserved-capacity-spot-overflow is enabled.
 resource "aws_ec2_capacity_reservation" "gpu" {
   count = local.reserved_enabled ? 1 : 0
 
@@ -21,9 +48,9 @@ resource "aws_ec2_capacity_reservation" "gpu" {
 }
 
 resource "kubectl_manifest" "nodeclasses" {
-  for_each = fileset(local.nodepools_manifests_path, "nodeclass-*.yml")
+  for_each = local.nodeclass_files
 
-  yaml_body = templatefile("${local.nodepools_manifests_path}/${each.value}", {
+  yaml_body = templatefile(each.value, {
     cluster_name            = local.name
     node_iam_role_name      = module.karpenter.node_iam_role_name
     capacity_reservation_id = local.reserved_enabled ? aws_ec2_capacity_reservation.gpu[0].id : ""
@@ -33,9 +60,9 @@ resource "kubectl_manifest" "nodeclasses" {
 }
 
 resource "kubectl_manifest" "nodepools" {
-  for_each = fileset(local.nodepools_manifests_path, "nodepool-*.yml")
+  for_each = local.nodepool_files
 
-  yaml_body = templatefile("${local.nodepools_manifests_path}/${each.value}", {})
+  yaml_body = templatefile(each.value, {})
 
   depends_on = [kubectl_manifest.nodeclasses, module.eks]
 }

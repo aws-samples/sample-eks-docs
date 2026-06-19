@@ -65,14 +65,38 @@ variable "dcgm_exporter_version" {
   default     = "4.8.2"
 }
 
+variable "nodepools" {
+  description = <<-EOT
+    GPU NodePool strategies to enable. Each value maps to a folder under nodepools/.
+    Multiple may be enabled as long as their manifest filenames (and thus NodePool/NodeClass names) don't collide.
+    dynamic-spot-on-demand and reserved-capacity-spot-overflow both manage the gpu-inf pool, so they are mutually exclusive.
+    To add a strategy: create nodepools/<name>/ with uniquely-named manifests and add <name> to the validation list below.
+  EOT
+  type    = set(string)
+  default = ["dynamic-spot-on-demand"]
+
+  validation {
+    condition = alltrue([
+      for p in var.nodepools : contains([
+        "dynamic-spot-on-demand",
+        "reserved-capacity-spot-overflow",
+      ], p)
+    ])
+    error_message = "Each entry must be an existing strategy folder under nodepools/."
+  }
+
+  validation {
+    condition     = !(contains(var.nodepools, "dynamic-spot-on-demand") && contains(var.nodepools, "reserved-capacity-spot-overflow"))
+    error_message = "dynamic-spot-on-demand and reserved-capacity-spot-overflow cannot be enabled together; both manage the gpu-inf NodePool."
+  }
+}
+
 variable "reserved_capacity" {
   description = <<-EOT
-    On-Demand Capacity Reservation (ODCR) for reserved-first GPU capacity with spot/on-demand overflow.
-    When enabled, Terraform creates the ODCR and switches the gpu-inf NodePool to the reserved set.
-    Note: an ODCR bills immediately until destroyed (terraform destroy or enabled = false).
+    ODCR parameters, used when reserved-capacity-spot-overflow is enabled. Terraform creates the
+    reservation and wires its id into the NodeClass. Note: an ODCR bills immediately until destroyed.
   EOT
   type = object({
-    enabled        = optional(bool, false)
     instance_type  = optional(string, "g6e.4xlarge")
     instance_count = optional(number, 1)
     az             = optional(string, "") # defaults to the first cluster AZ
