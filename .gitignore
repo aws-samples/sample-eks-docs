@@ -3,8 +3,8 @@
 **/.terraform/*
 .terraform/
 
-# Terraform lock file for the dependency selections (keep .terraform.lock.hcl tracked)
-# .terraform.lock.hcl is intentionally NOT ignored.
+# Terraform dependency lock files
+.terraform.lock.hcl
 
 # State files — may contain secrets, never commit
 *.tfstate
