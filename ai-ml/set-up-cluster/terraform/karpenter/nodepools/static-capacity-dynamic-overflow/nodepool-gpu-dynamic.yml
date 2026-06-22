@@ -1,7 +1,9 @@
+# Overflow pool. When the static reserved nodes are full, pods go Pending and Karpenter provisions
+# spot/on-demand nodes here, using the gpu-dynamic EC2NodeClass.
 apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
-  name: gpu-inf
+  name: gpu-dynamic
 spec:
   template:
     metadata:
@@ -12,7 +14,7 @@ spec:
       nodeClassRef:
         group: karpenter.k8s.aws
         kind: EC2NodeClass
-        name: gpu-inf
+        name: gpu-dynamic
       taints:
         - key: nvidia.com/gpu
           effect: NoSchedule

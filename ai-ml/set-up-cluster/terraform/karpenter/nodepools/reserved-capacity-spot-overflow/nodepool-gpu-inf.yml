@@ -30,5 +30,4 @@ spec:
           operator: In
           values: ["amd64"]
   limits:
-    cpu: 1000
-    memory: 5000Gi
+    nvidia.com/gpu: 64

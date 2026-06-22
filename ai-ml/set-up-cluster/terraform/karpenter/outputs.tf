@@ -17,3 +17,13 @@ output "node_iam_role_name" {
   description = "Karpenter node IAM role name. Plug into the reserved-capacity EC2NodeClass when applying it manually."
   value       = module.karpenter.node_iam_role_name
 }
+
+output "model_bucket" {
+  description = "S3 bucket for model weights."
+  value       = aws_s3_bucket.models.id
+}
+
+output "configure_model_bucket" {
+  description = "Command to export the model bucket name for the guide steps."
+  value       = "export MODEL_BUCKET=${aws_s3_bucket.models.id}"
+}

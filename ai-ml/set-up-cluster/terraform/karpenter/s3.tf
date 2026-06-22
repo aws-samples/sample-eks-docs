@@ -1,6 +1,6 @@
 locals {
   s3_models_sa_namespace = "default"
-  s3_models_sa_name      = "model-storage"
+  s3_models_sa_name      = "model-storage-sa"
 }
 
 resource "aws_s3_bucket" "models" {

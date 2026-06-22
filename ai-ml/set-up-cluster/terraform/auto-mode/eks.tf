@@ -47,6 +47,11 @@ module "eks" {
     enabled    = true
     node_pools = ["system", "general-purpose"]
   }
+
+  # Authenticate to public ECR (public.ecr.aws) so image pulls aren't anonymous and rate-limited.
+  node_iam_role_additional_policies = {
+    AmazonElasticContainerRegistryPublicReadOnly = "arn:aws:iam::aws:policy/AmazonElasticContainerRegistryPublicReadOnly"
+  }
 }
 
 #---------------------------------------------------------------

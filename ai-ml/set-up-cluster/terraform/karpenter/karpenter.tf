@@ -16,6 +16,8 @@ module "karpenter" {
 
   node_iam_role_additional_policies = {
     AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    # Authenticate to public ECR (public.ecr.aws) so image pulls aren't anonymous and rate-limited.
+    AmazonElasticContainerRegistryPublicReadOnly = "arn:aws:iam::aws:policy/AmazonElasticContainerRegistryPublicReadOnly"
   }
 }
 

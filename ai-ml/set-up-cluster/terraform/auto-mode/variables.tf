@@ -71,13 +71,26 @@ variable "nodepools" {
       for k in keys(var.nodepools) : contains([
         "dynamic-spot-on-demand",
         "reserved-capacity-spot-overflow",
+        "static-capacity-dynamic-overflow",
       ], k)
     ])
     error_message = "Each key must be an existing strategy folder under nodepools/."
   }
 
   validation {
-    condition     = !(contains(keys(var.nodepools), "dynamic-spot-on-demand") && contains(keys(var.nodepools), "reserved-capacity-spot-overflow"))
-    error_message = "dynamic-spot-on-demand and reserved-capacity-spot-overflow cannot be enabled together; both manage the gpu-inf NodePool."
+    condition = length(setintersection(keys(var.nodepools), [
+      "dynamic-spot-on-demand",
+      "reserved-capacity-spot-overflow",
+      "static-capacity-dynamic-overflow",
+    ])) <= 1
+    error_message = "Enable at most one GPU inference strategy (dynamic-spot-on-demand, reserved-capacity-spot-overflow, static-capacity-dynamic-overflow); each is a complete solution for the gpu-inf workload."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.nodepools :
+      contains(["reserved-capacity-spot-overflow", "static-capacity-dynamic-overflow"], k) ? v.reservation != null : true
+    ])
+    error_message = "reserved-capacity-spot-overflow and static-capacity-dynamic-overflow require a `reservation` (their reserved nodes run on an ODCR)."
   }
 }
