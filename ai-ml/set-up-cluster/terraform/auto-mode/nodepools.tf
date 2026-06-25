@@ -1,22 +1,4 @@
-# GPU NodePools, controlled by var.nodepools (a map keyed by folder name under nodepools/).
-# Defaults to { "spot-ondemand" = {} }.
-#
-# Usage:
-#   terraform apply
-#       -> spot-ondemand only (default)
-#   terraform apply -var 'nodepools={"reserved-spot-ondemand"={reservation={}}}'
-#       -> reserved gpu-inf pool (reserved-first, spot/on-demand overflow). reservation={} makes Terraform
-#          create a tagged ODCR with defaults (g6e.4xlarge, 1 instance, first cluster AZ); the NodeClass
-#          selects it by tag (nodepool=reserved-spot-ondemand).
-#   terraform apply -var 'nodepools={"static-spot-ondemand"={reservation={instance_type="g6e.xlarge",instance_count=3}}}'
-#       -> always-on reserved pool (gpu-static, replicas = instance_count) backed by an ODCR, plus a
-#          gpu-dynamic spot/on-demand overflow pool.
-#   reservation overrides instance_type / instance_count / az, e.g. {reservation={instance_type="g6e.4xlarge",instance_count=2,az="us-east-2a"}}
-#
-# Notes:
-#   - spot-ondemand, reserved-spot-ondemand, and static-spot-ondemand are
-#     mutually exclusive GPU inference strategies; enable at most one (enforced by a validation).
-#   - Each strategy with a `reservation` gets its own ODCR tagged nodepool=<key>.
+# GPU NodePools, selected by var.nodepools. See ../README.md for usage (strategies, reserved capacity).
 
 locals {
   nodepools_dir = "${path.module}/nodepools"
@@ -35,12 +17,8 @@ locals {
   nodepool_files  = { for f, m in local.manifests : f => m if startswith(f, "nodepool-") }
 }
 
-# One ODCR per strategy that sets `reservation`, tagged nodepool=<key> so the matching NodeClass can
-# select it by tag. Bills immediately until destroyed.
-#
-# The reservation is a single atomic block in one AZ (reservation.az, default the first cluster AZ):
-# EC2 either reserves all instance_count in that AZ or fails with InsufficientInstanceCapacity. There
-# is no automatic AZ fallback — if creation fails, set reservation.az to another AZ and re-apply.
+# One ODCR per strategy that sets `reservation`, tagged nodepool=<key> so the matching NodeClass
+# selects it by tag. Single AZ, no fallback; bills until destroyed. See ../README.md.
 resource "aws_ec2_capacity_reservation" "gpu" {
   for_each = { for strategy, cfg in var.nodepools : strategy => cfg.reservation if cfg.reservation != null }
 
