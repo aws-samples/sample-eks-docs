@@ -12,9 +12,15 @@ prometheus:
     serviceMonitorSelectorNilUsesHelmValues: false
     podMonitorSelectorNilUsesHelmValues: false
     enableRemoteWriteReceiver: true
-    retention: 5h
+    retention: 2h
     scrapeInterval: 30s
     evaluationInterval: 30s
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        memory: 8Gi
     remoteWrite:
       - url: ${remote_write_url}
         sigv4:
@@ -30,6 +36,12 @@ prometheus:
       node-role: system
 
 prometheusOperator:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
   tolerations:
     - key: CriticalAddonsOnly
       operator: Exists
@@ -44,6 +56,12 @@ prometheusOperator:
         node-role: system
 
 kube-state-metrics:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
   nodeSelector:
     node-role: system
   tolerations:
@@ -52,6 +70,12 @@ kube-state-metrics:
 
 grafana:
   enabled: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
   serviceAccount:
     create: true
     name: ${grafana_service_account}
@@ -100,7 +124,7 @@ grafana:
         datasource:
           - name: DS_PROMETHEUS
             value: Amazon-Managed-Prometheus
-      dashboard-25494:
+      vllm-load-analysis:
         gnetId: 25494
         revision: 1
         datasource:
@@ -113,5 +137,11 @@ grafana:
       operator: Exists
 
 prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
   tolerations:
     - operator: Exists
