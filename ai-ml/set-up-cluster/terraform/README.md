@@ -11,7 +11,7 @@ monitoring stack (Amazon Managed Prometheus, DCGM exporter, Grafana).
 
 ## Defaults
 
-The cluster is named `ai-eks-docs` and lands in `us-east-2`. **Leave these as-is** so the
+The cluster is named `ai-eks-docs` and lands in `us-east-2`. **Leave the name as-is** so the
 copy/paste commands in the user guide keep working.
 
 ## Deploy
