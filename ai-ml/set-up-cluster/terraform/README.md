@@ -1,30 +1,91 @@
-## Cluster setup (Terraform)
+# ML on EKS - cluster setup (Terraform)
 
-Two variants of the same GPU-ready EKS cluster. Pick one based on how you want to manage compute:
+Terraform for the cluster used in [ML on EKS](https://docs.aws.amazon.com/eks/latest/userguide/ml-on-eks.html).
+Two variants are provided; pick one:
 
-- [`auto-mode/`](auto-mode/) - EKS Auto Mode manages the GPU nodes.
-- [`karpenter/`](karpenter/) - Self-managed Karpenter provisions the GPU nodes.
+- `auto-mode/` - EKS Auto Mode manages the compute.
+- `karpenter/` - self-managed Karpenter manages the compute.
 
-Both provision the cluster, monitoring (Amazon Managed Prometheus, DCGM exporter), an S3 model bucket, and GPU NodePools.
+Each builds the same thing: a VPC, an EKS cluster, GPU NodePools for inference, and the
+monitoring stack (Amazon Managed Prometheus, DCGM exporter, Grafana).
 
-### Apply
+## Defaults
+
+The cluster is named `ai-eks-docs` and lands in `us-east-2`. **Leave these as-is** so the
+copy/paste commands in the user guide keep working.
+
+## Deploy
 
 ```bash
-export TF_VAR_region=us-east-2
-export TF_VAR_cluster_name=ai-eks-docs
-
+cd auto-mode   # or: cd karpenter
 terraform init
 terraform apply
 ```
 
-After apply, use the `configure_kubectl` output to connect:
+When it finishes, configure `kubectl` (the same command regardless of variant, since the cluster
+name and region are fixed):
 
 ```bash
-terraform output -raw configure_kubectl
+aws eks update-kubeconfig --region us-east-2 --name ai-eks-docs --alias ai-eks-docs
 ```
 
-### GPU NodePool strategies
+The outputs also include the node IAM role name and the model S3 bucket.
 
-`var.nodepools` selects which GPU strategy to deploy (defaults to `dynamic-spot-on-demand`). Set a `reservation` to have Terraform create a tagged On-Demand Capacity Reservation. Enable at most one strategy at a time. See the comments at the top of `nodepools.tf` for the available strategies and examples.
+## GPU NodePools
 
-> Run `terraform fmt` and `terraform validate` before applying.
+`var.nodepools` selects the GPU inference strategy. It defaults to `dynamic-spot-on-demand`, so a
+plain `terraform apply` needs no extra flags. The three strategies are mutually exclusive (each is a
+complete solution for the inference workload); enable at most one.
+
+| Strategy                           | What you get                                                                                              |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `dynamic-spot-on-demand` (default) | On-demand GPU pool, spot-first with on-demand overflow. No reservation.                                   |
+| `reserved-capacity-spot-overflow`  | Reserved GPU pool backed by an ODCR, with spot/on-demand overflow.                                        |
+| `static-capacity-dynamic-overflow` | Always-on reserved pool (replicas = reserved instance count) plus a dynamic spot/on-demand overflow pool. |
+
+### Reserved capacity
+
+The reserved strategies need a `reservation`. Terraform creates the
+On-Demand Capacity Reservation (ODCR) for you - you do not supply a reservation ID. The ODCR is
+tagged `nodepool=<strategy>` and the NodeClass selects it by that tag.
+
+Use defaults (`g6e.4xlarge`, 1 instance, first cluster AZ):
+
+```bash
+terraform apply -var 'nodepools={"reserved-capacity-spot-overflow"={reservation={}}}'
+```
+
+Pick the instance type, count, and AZ:
+
+```bash
+terraform apply -var 'nodepools={"reserved-capacity-spot-overflow"={reservation={instance_type="g6e.4xlarge",instance_count=3,az="us-east-2a"}}}'
+```
+
+Always-on static pool (3 reserved instances) with dynamic overflow:
+
+```bash
+terraform apply -var 'nodepools={"static-capacity-dynamic-overflow"={reservation={instance_type="g6e.xlarge",instance_count=3}}}'
+```
+
+Notes:
+
+- An ODCR **bills as soon as it is created** and keeps billing until destroyed, whether or not
+  nodes are running on it.
+- The reservation is a single block in **one AZ**. EC2 reserves all of `instance_count` in that AZ
+  or fails with `InsufficientInstanceCapacity` - there is no automatic AZ fallback. If creation
+  fails, set `reservation.az` to another AZ and re-apply.
+
+## Clean up
+
+To stop GPU charges while keeping the cluster running, drop the reservation by applying back to the
+default. This destroys the ODCR and its reserved nodes; the cluster and monitoring stack stay up:
+
+```bash
+terraform apply
+```
+
+To delete everything this stack created (cluster, VPC, monitoring, any ODCR):
+
+```bash
+terraform destroy
+```
