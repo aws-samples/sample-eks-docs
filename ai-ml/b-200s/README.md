@@ -40,6 +40,60 @@ Configure `kubectl`:
 aws eks update-kubeconfig --region ap-south-1 --name ai-eks-docs --alias ai-eks-docs
 ```
 
+### Deploy the FSx for Lustre file system (optional)
+
+The stack can also provision an EFA-enabled FSx for Lustre file system with the FSx CSI
+driver and a static PV/PVC. This is gated behind `enable_fsx` and is not created by the
+default apply above.
+
+Lustre uses a single subnet, so the file system must land in the **same AZ as the capacity
+block** for EFA to work. Derive that AZ from the reservation and pick the matching private
+subnet (tagged `karpenter.sh/discovery`):
+
+```bash
+export FSX_AZ=$(aws ec2 describe-capacity-reservations \
+  --region ap-south-1 \
+  --capacity-reservation-ids $CAPACITY_RESERVATION_ID \
+  --query 'CapacityReservations[0].AvailabilityZone' \
+  --output text)
+
+export FSX_SUBNET_ID=$(aws ec2 describe-subnets \
+  --region ap-south-1 \
+  --filters "Name=tag:karpenter.sh/discovery,Values=ai-eks-docs" "Name=availability-zone,Values=$FSX_AZ" \
+  --query 'Subnets[0].SubnetId' \
+  --output text)
+
+echo "FSx AZ: $FSX_AZ  Subnet: $FSX_SUBNET_ID"
+```
+
+Re-apply the stack with `enable_fsx=true` (adds only the FSx resources):
+
+```bash
+terraform apply \
+  -var 'region=ap-south-1' \
+  -var 'enable_fsx=true' \
+  -var "subnet_id=$FSX_SUBNET_ID" \
+  -var 'storage_capacity=76800' \
+  -var 'per_unit_storage_throughput=1000'
+```
+
+The file system takes ~10-20 minutes to reach `AVAILABLE`. Verify:
+
+```bash
+terraform output fsx_file_system_id
+kubectl get pvc fsx-lustre-claim -n default
+```
+
+Expected output:
+
+```
+NAME               STATUS   VOLUME          CAPACITY   ACCESS MODES
+fsx-lustre-claim   Bound    fsx-lustre-pv   76800Gi    RWX
+```
+
+The PV uses a `Retain` reclaim policy, so the file system is not deleted by the cleanup steps
+below. To remove it later, re-apply with `-var 'enable_fsx=false'` (keeping the other vars).
+
 ### Apply the EC2NodeClass and NodePool
 
 `nodeclass-gpu-static.yaml` uses `${CLUSTER_NAME}`, `${KARPENTER_NODE_ROLE}`, and
