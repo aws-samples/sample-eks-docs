@@ -40,15 +40,9 @@ variable "per_unit_storage_throughput" {
 
 variable "subnet_id" {
   description = <<-EOT
-    Subnet for the FSx for Lustre file system. Lustre uses a single subnet, which SHOULD be in the
-    same AZ as the GPU nodes that mount it. Required when enable_fsx = true.
-
-    Note: on EKS Auto Mode, nodes mount Lustre over TCP via the FSx CSI driver. The node-level
-    EFA-accelerated Lustre client (RDMA transport) requires a userData bootstrap script to install
-    the Lustre + EFA drivers, which Auto Mode does not support - so that acceleration is only
-    available on the self-managed Karpenter variant. EfaEnabled is still set on the file system
-    (it is required for PERSISTENT_2 with the metadata configuration below and is harmless for the
-    TCP mount path), but Auto Mode clients will not use the EFA transport.
+    Subnet for the FSx for Lustre file system. Lustre uses a single subnet, which MUST be in the
+    same AZ as the GPU nodes that mount it. For EFA-accelerated mounts the file system and clients
+    must also share the same /16 CIDR block. Required when enable_fsx = true.
   EOT
   type        = string
   default     = ""
@@ -61,6 +55,11 @@ variable "subnet_id" {
 
 # -----------------------------------------------------------------------------
 # File system
+#
+# On this self-managed Karpenter variant, the gpu-static-fsx NodeClass installs the EFA-enabled
+# Lustre client via userData (see nodepools/b-200s-static-fsx/), so GPU nodes can mount this file
+# system over the EFA (RDMA) transport rather than TCP. That client install is the piece EKS Auto
+# Mode cannot do (no userData), which is why the EFA path lives here.
 # -----------------------------------------------------------------------------
 
 resource "aws_fsx_lustre_file_system" "this" {
@@ -103,7 +102,7 @@ resource "aws_fsx_lustre_file_system" "this" {
 resource "aws_iam_role" "fsx_csi" {
   count = var.enable_fsx ? 1 : 0
 
-  name               = "${local.name}-fsx-csi-controller"
+  name_prefix        = "${local.name}-fsx-csi-"
   assume_role_policy = data.aws_iam_policy_document.pod_identity_assume.json
 }
 
@@ -198,4 +197,9 @@ output "fsx_file_system_id" {
 output "fsx_file_system_dns_name" {
   description = "FSx for Lustre DNS name."
   value       = one(aws_fsx_lustre_file_system.this[*].dns_name)
+}
+
+output "fsx_file_system_mount_name" {
+  description = "FSx for Lustre mount name (used for manual node-level EFA mounts)."
+  value       = one(aws_fsx_lustre_file_system.this[*].mount_name)
 }
