@@ -26,6 +26,10 @@ spec:
         - key: karpenter.k8s.aws/instance-generation
           operator: Gt
           values: ["4"]
+        # G7 requires NVIDIA driver 595+; EKS-optimized accelerated AMIs currently ship 580.
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Lt
+          values: ["7"]
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]
