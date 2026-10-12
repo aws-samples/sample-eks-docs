@@ -19,6 +19,8 @@ terraform apply
 
 This gives you a running cluster with the monitoring stack and ingress. You can customize the defaults by overriding them using `-var <property=value>`.
 
+> **Run `terraform apply` directly - don't apply a saved plan file.** The `kubernetes`, `helm`, and `kubectl` providers authenticate with a token from the `aws_eks_cluster_auth` data source. `terraform plan -out` freezes that token, and it has expired by the time you apply the saved plan, so every Helm release and Kubernetes object fails with `Unauthorized` / `the server has asked for the client to provide credentials` after the cluster itself is already created.
+
 ## Access EKS Cluster
 
 Verify the cluster is up. The stack emits a ready-to-run `update-kubeconfig` command with the values provided during deployment.
@@ -126,8 +128,27 @@ kubectl --namespace monitoring get secrets kube-prometheus-stack-grafana -o json
 
 ## Clean up
 
-To delete everything this stack created (cluster, VPC, monitoring, any ODCR):
+Use the helper script, which drains the Karpenter-managed nodes, removes the Ingresses so the load balancer controller deletes their ALBs and security groups, and then runs `terraform destroy` (retrying once if a Helm uninstall times out):
 
 ```bash
+../../scripts/cleanup.sh            # add --auto-approve to skip the prompt
+```
+
+To delete everything by hand instead (cluster, VPC, monitoring, any ODCR):
+
+```bash
+kubectl delete ingress -A --all     # let the controller remove the ALBs first
 terraform destroy
+```
+
+Pass `terraform destroy` the same `-var` overrides you passed to `terraform apply`, including `region` and `nodepools`; Terraform does not persist variables between commands.
+
+The ALB and the security groups that the load balancer controller creates for an `Ingress` are not in Terraform state. If you skip deleting the Ingresses, their network interfaces hold the public subnets and the destroy stalls on `aws_subnet.public[*]`, the internet gateway, and `aws_vpc`. Delete the leftovers and the destroy continues:
+
+```bash
+aws elbv2 describe-load-balancers --region "$REGION" \
+  --query "LoadBalancers[?VpcId=='$VPC_ID'].LoadBalancerArn" --output text
+aws ec2 describe-security-groups --region "$REGION" \
+  --filters "Name=tag:elbv2.k8s.aws/cluster,Values=$CLUSTER_NAME" \
+  --query 'SecurityGroups[].GroupId' --output text
 ```

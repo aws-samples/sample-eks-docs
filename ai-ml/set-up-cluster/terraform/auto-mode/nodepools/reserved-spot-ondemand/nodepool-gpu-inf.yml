@@ -25,10 +25,11 @@ spec:
         - key: eks.amazonaws.com/instance-generation
           operator: Gt
           values: ["4"]
-        # G7 requires NVIDIA driver 595+; EKS-optimized accelerated AMIs currently ship 580.
-        - key: eks.amazonaws.com/instance-generation
-          operator: Lt
-          values: ["7"]
+        # The Bottlerocket NVIDIA AMI ships driver 580; g7 needs 595+. Other
+        # generation-7 families, such as g7e, run on 580 and stay eligible.
+        - key: eks.amazonaws.com/instance-family
+          operator: NotIn
+          values: ["g7"]
         - key: kubernetes.io/arch
           operator: In
           values: ["amd64"]
