@@ -1,0 +1,65 @@
+# Written by terraform/open-source. Do not edit by hand: the next apply overwrites it.
+#
+# The copy in the repository is a placeholder that shows the shape. Every value in it is
+# deliberately invalid rather than plausible: the
+# charts' fail guards refuse to render against these, which is the intended behaviour. A chart that
+# rendered cleanly against placeholders would produce IAM trust policies naming account
+# ACCOUNT_ID_NOT_SET and a gateway role that does not exist, and the cluster would look configured.
+#
+# `terraform apply` in terraform/open-source writes the rendered file here. It names your account,
+# your cluster, your OIDC issuer and your ECR repositories, and it goes to no repository at all:
+# scripts/bootstrap-gitops.sh folds it into the root Application's helm.values, which is the only
+# way it reaches the cluster. Don't commit it.
+accountId: ACCOUNT_ID_NOT_SET
+cluster: CLUSTER_NOT_SET
+region: REGION_NOT_SET
+partition: aws
+path: open-source
+
+# From the cluster_oidc_issuer_url output. Every projected-token audience check and every IAM trust
+# policy for an agent is built from this, so an empty value fails the chart rather than rendering a
+# trust policy no token can satisfy.
+oidcIssuerUrl: ""
+
+mesh:
+  # `none` is the default, as on the other path. Terraform's mesh_mode sets this AND leaves
+  # 19-istio-namespace.yaml and 20-istio.yaml out of the platform chart's excluded list, so the two
+  # cannot disagree.
+  # The agents-mesh page of the EKS User Guide covers `ambient`.
+  mode: "none"
+  trustDomain: cluster.local
+
+gateway:
+  # The in-cluster AgentGateway. `serviceAccount` is the GATEWAY OBJECT's name, not the
+  # controller's -- the data plane's Pod Identity association is on that service account, and
+  # naming the controller leaves the gateway with no AWS identity at all.
+  namespace: agentgateway-system
+  serviceAccount: egress
+  audience: agentgateway
+  trustDomain: cluster.local
+  # From the gateway_role_arn output: the role the gateway assumes an agent's identity from.
+  roleArn: ""
+  auditLogGroup: ""
+  secretNames: {}
+
+storage:
+  checkpointBucket: ""
+
+capabilities:
+  ack:
+    roleName: ""
+  kro:
+    roleName: ""
+
+agentResource:
+  enabled: true
+  rolePath: /eks-agents/
+  permissionsBoundaryArn: ""
+
+# Image URIs for the four reference workloads, from the ecr_repository_urls output. Empty until you
+# build and push them -- see the quickstart in the top-level README.
+registry: {}
+
+# Agents declared in Terraform rather than as `Agent` resources in the cluster. Leaving this empty
+# is what enables the `Agent` resource definition; the two are alternatives.
+agents: {}

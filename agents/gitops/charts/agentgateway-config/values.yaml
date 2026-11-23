@@ -1,0 +1,354 @@
+# AgentGateway configuration.
+#
+# The AWS-specific values here — region, the agent role ARNs, the secret names — come from the file
+# Terraform renders, passed as a second values file by the Argo CD Application. What is set here is
+# the policy: which model, which destinations, which budget, which tools.
+#
+# The schema these templates are written against is AgentGateway v1alpha1, as the v1.7.0 CRDs
+# install it (see templates/00-gateway.yaml). The field shapes that differ from a naive reading, and
+# which this chart gets right:
+#
+#   - Backend selectors are spec.static / spec.mcp / spec.ai / spec.aws / spec.a2a /
+#     spec.dynamicForwardProxy. There is no spec.host.
+#   - Per-backend connection and credential settings live under spec.policies (tls, auth, http,
+#     tunnel), not at the top level.
+#   - AgentgatewayPolicy splits into frontend / traffic / backend buckets by attachment role. There
+#     is no top-level authentication, mcp or ai.
+#   - MCP tool governance is backend.mcp.authorization (CEL) plus
+#     backend.mcp.guardrails.processors[].methods, not a tools allow/deny list.
+#
+# See VERSIONS.md for the pin.
+
+region: "REGION_NOT_SET"
+cluster: "CLUSTER_NOT_SET"
+oidcIssuerUrl: ""
+
+namespaces:
+  reasoning: agents
+
+gateway:
+  namespace: agentgateway-system
+
+  # The Gateway's name, which AgentGateway's controller also uses for the data plane Service it
+  # creates. So this is the name an agent addresses, and it has to equal gateway.serviceName in
+  # gitops/base/values.yaml -- scripts/validate.sh checks that, because a mismatch is a
+  # ConnectTimeout from the agent rather than an error anywhere.
+  name: egress
+
+  # The port the gateway listens on for agent traffic. Agents address this directly; with Istio
+  # ambient in the path, ztunnel delivers captured egress here instead and the agent addresses the
+  # real host.
+  port: 8080
+
+  # The audience the agent's projected service account token must name. The gateway rejects a token
+  # minted for any other relying party, which together with the subject match is the whole of the
+  # separation between relying parties -- there is no audience allowlist at token fetch time.
+  audience: agentgateway
+
+  # Create the `agentgateway` GatewayClass from this chart.
+  #
+  # FALSE, because the agentgateway controller registers it on startup and the agentgateway Helm
+  # chart does not -- so the object exists, belongs to no release, and a chart that renders it again
+  # collides with it. Helm refuses the release outright; Argo CD takes shared ownership through
+  # ServerSideApply and leaves two things believing they own one object. See the comment in
+  # templates/00-gateway.yaml.
+  createGatewayClass: false
+
+  # Handle the CONNECT that ztunnel delivers for a captured connection, and route the inner request.
+  #
+  # Separate from `capture.enabled` below on purpose: this one is about what the gateway does with a
+  # tunnelled connection that arrives, and it is harmless when none does. `capture.enabled` is what
+  # causes connections to arrive, and it has a blast radius.
+  capturedEgress: true
+
+# Transparent capture: whether an agent reaches the gateway by addressing it, or by addressing the
+# real host and having the mesh redirect. See gitops/charts/agentgateway-config/templates/05-capture.yaml
+# for the mechanism and the agents-mesh page of the EKS User Guide for why it is the target shape.
+capture:
+  # OFF, for two independent reasons.
+  #
+  # A pod in a Nitro sandbox isn't captured by ztunnel, and every agent here is sandboxed, so this
+  # redirects nothing an agent sends.
+  #
+  # And the ServiceEntry is cluster-wide by default, so it redirects the captured
+  # port for every ambient-enrolled pod on the cluster rather than only for agents. On a cluster
+  # that runs anything else, that is other people's traffic arriving at the agent egress gateway and
+  # getting a 404. Scope it with exportToNamespaces before enabling it anywhere shared.
+  #
+  # Also requires a ztunnel with the CIDR-lookup fix: 1.30.6-1.30.8, 1.31.2 and later, or 1.32.0
+  # and later (the pin is 1.31.4). On 1.30.4 and 1.30.5 the lookup returns no healthy upstream while
+  # reporting the entry correctly -- a silent failure, not an error.
+  enabled: false
+
+  # Every IPv4 address. Narrowing this to a CIDR is not a way to pick destinations -- the gateway's
+  # routes do that -- it is a way to limit which address ranges are redirected at all.
+  addresses: 0.0.0.0/0
+
+  # The port captured, where agents speak plaintext so the gateway can read the request, attach the
+  # credential and originate TLS itself. Traffic on any other port is not captured, goes direct, and
+  # is refused by the egress network policy: both outcomes fail closed.
+  port: 80
+
+  # Which namespaces see the ServiceEntry. Empty means the whole cluster; list namespaces to limit
+  # redirection to them, which is the right setting on any cluster this stack shares.
+  exportToNamespaces: []
+
+  # The label the ServiceEntry selects the gateway's pods by, set on the provisioned Deployment
+  # through AgentgatewayParameters. One value used in both places; changing it here changes both.
+  gatewayPodLabels:
+    app: agentgateway-egress
+
+model:
+  # Bedrock with Claude Sonnet is the model on both paths. The gateway selects it, not the agent, so
+  # a change of model, failover between models and a per-agent token budget are all gateway-side
+  # changes the agent never sees.
+  bedrockModelId: us.anthropic.claude-sonnet-5-5
+
+  # Have the gateway assume the calling agent's own IAM role and sign the model call on it.
+  #
+  # This is where per-agent AWS authority and per-agent attribution come from. Turning it off
+  # makes the gateway sign as itself, which means one model allowance for every agent and CloudTrail
+  # showing the gateway rather than the agent.
+  #
+  # The role ARN and the session name are NOT configurable here, and the reason is a CRD constraint
+  # rather than an omission: `assumeRole.roleArn` is validated against
+  # `^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$`, so it cannot be a CEL expression over the verified
+  # caller, so one backend cannot derive the role per request -- which is why there is one backend
+  # per agent and why the template builds both values by concatenation from the agent's name. The
+  # CRD does accept `sessionNameExpression` as an alternative to
+  # `sessionName`, but it buys nothing while the role ARN is still fixed per backend.
+  perAgentRoleAssumption: true
+
+  # Binds the assumption to this gateway, matching the external-ID condition
+  # terraform/modules/agent-identity writes into each agent role's trust policy. Empty omits it,
+  # which is weaker: any session from the gateway's role could then assume any agent role it is
+  # listed on.
+  externalId: ""
+
+  # Session tags on the assumed role. This is the half of attribution that reaches the bill:
+  # sessionName gets the agent into CloudTrail, and the Cost and Usage Report splits spend on
+  # activated cost allocation tags instead. Without these a model call's dollars have no join key
+  # back to the pod that spent them, a gap that split cost allocation data leaves open.
+  #
+  # Requires sts:TagSession in each agent role's trust policy, which
+  # terraform/modules/agent-identity grants alongside sts:AssumeRole -- AssumeRole alone fails with
+  # "not authorized to perform: sts:TagSession" once tags are set.
+  #
+  # AND ONE MANUAL STEP THAT CANNOT BE AUTOMATED: activate these keys as cost allocation tags in the
+  # Billing console of the payer account. There is no API for activation, Terraform cannot do it, and
+  # until it happens the tags are recorded on every session and appear in no report. The next_steps
+  # Terraform output names it.
+  sessionTags:
+    enabled: true
+
+    # The key carrying the agent's name. Configurable because activation is account-wide: a payer
+    # account already splitting cost on its own key should reuse that key rather than activate a
+    # second one meaning the same thing.
+    agentKey: agent
+
+    # The key carrying the cluster name, so one account running several clusters can separate them.
+    clusterKey: cluster
+
+    # Additional static key/value pairs, merged after the two above. A tag whose value has to vary
+    # per request takes a CEL `expression` instead of `value` in the CRD; this stack has one backend
+    # per agent, so a static value is always enough. STS caps a session at 50 tags.
+    extra: {}
+
+  # Models the gateway may fail over to, in order. Failover is one of the things that needs the
+  # request in view and is therefore the gateway's to do; an agent cannot retry against a model its
+  # own role does not name.
+  fallbackModelIds: []
+
+  # The two policies that make the list above actually fail over. Priority groups define the order
+  # and nothing else: a group is skipped only once a provider is evicted, so without the health
+  # policy the primary is the only model ever used, and without the retry policy the agent sees the
+  # error that triggered the failover. Rendered only when fallbackModelIds is non-empty.
+  failover:
+    # Evict on provider 5xx and on provider throttling. 429 is the case this exists for: Bedrock
+    # quotas are per model, so a throttled primary can fail over to another model instead of
+    # returning the throttle. The gateway's own token-budget 429 is a local decision and never a
+    # backend response, so it does not reach this condition and cannot evict a model.
+    unhealthyCondition: "response.code >= 500 || response.code == 429"
+
+    # Base eviction window, growing multiplicatively on repeated evictions. If every provider is
+    # evicted the load balancer returns an evicted one rather than failing, so the floor is the
+    # primary rather than an error.
+    evictionDuration: 30s
+
+    # Evict on the first unhealthy response, so a throttled primary fails over immediately. Raise it
+    # to tolerate transient blips, at the cost of a slower failover and a visible first error.
+    evictionConsecutiveFailures: 1
+
+    # Retries happen inside the same client call, which is what hides the failover. Small on purpose:
+    # a retry buffers the request body in memory for replay, and for a chat completion that body is
+    # the prompt.
+    retryAttempts: 2
+    retryBackoff: 1s
+    retryCodes: [429, 500, 502, 503, 504]
+
+# Per-agent token budget. This is the control the base layer cannot express at all, because it needs
+# to see the request. Set it per agent: one fleet-wide budget tells a platform team nothing about
+# which agent spent it.
+budgets:
+  enabled: true
+  default:
+    # Tokens per hour, per agent identity. Pick a number from the agent's expected traffic rather
+    # than from what feels large; the point of a budget is that exceeding it is a signal.
+    tokensPerHour: 1000000
+
+  # Keyed by agent name, overriding the default.
+  perAgent: {}
+
+# Third-party destinations the gateway brokers a credential for, keyed by a short name that matches
+# the key in Terraform's third_party_credentials. The gateway holds the credential and attaches it
+# per caller, so the agent never holds a GitHub or Slack token.
+destinations: {}
+# destinations:
+#   github:
+#     host: api.github.com
+#     port: 443
+#     # The Kubernetes Secret the credential was synced into, and the key inside it. Terraform
+#     # creates the Secrets Manager secret; getting its value into the cluster is a secret syncer's
+#     # job (External Secrets Operator or the AWS Secrets Store CSI driver), not this chart's.
+#     secretName: agentgateway-github
+#     secretKey: token
+#     # Which agents may reach it. An empty list means every agent in the namespace, which is almost
+#     # never what a platform team wants for a credentialed destination.
+#     callers: ["research"]
+
+# MCP servers aggregated behind one endpoint, so an agent reaches a single /mcp path rather than
+# carrying a connection per server.
+# The reference MCP server from gitops/examples/mcp-server, which is what makes tools/list return
+# something. Remove this entry if you are not deploying it; an entry whose Service does not exist
+# leaves the gateway reporting a target it cannot reach.
+mcpServers:
+  reference:
+    # The namespace the MCP Service lives in: `mcp-servers`, where gitops/examples/mcp-server deploys
+    # it -- not an agent namespace, whose namespace-wide allows would let any agent call it directly
+    # (see that file's header). Omitted, it defaults to the reasoning namespace. A selector without a namespace matches nothing
+    # across namespaces, and the gateway reports `mcp: no backends configured` with a 503 rather
+    # than anything about namespaces -- so set it explicitly if your servers live elsewhere.
+    namespace: mcp-servers
+    # AND THE SELECTOR IS ONLY HALF OF IT. Whatever Service these labels match must also set
+    # `appProtocol: agentgateway.dev/mcp` (or `...dev/mcp-sse`) ON THE PORT, or it contributes no
+    # targets and you get the same 503 as a selector that matches nothing. There is no condition
+    # anywhere that reports this: the Backend goes `Accepted: True` and the HTTPRoute
+    # `ResolvedRefs: True` either way, because the port scan that comes up empty has no status of
+    # its own. See the comment on the Service in gitops/examples/mcp-server/mcp-server.yaml.
+    serviceSelector:
+      app: mcp-server
+# mcpServers:
+#   github:
+#     # An in-cluster MCP server, selected by label.
+#     serviceSelector:
+#       app: github-mcp-server
+#   awsKnowledge:
+#     # A remote one.
+#     host: aws-mcp.us-east-1.api.aws
+#     port: 443
+#     path: /mcp
+
+# Tool-level policy. CEL over the caller's identity and the tool being called, evaluated at the
+# gateway where the arguments are in view.
+toolPolicy:
+  enabled: true
+
+  # Tools no agent may call, whatever else allows it. A denylist is weaker than an allowlist in
+  # general, and it is the right shape here because the catalogue behind an aggregated MCP endpoint
+  # changes without this file changing.
+  deniedTools:
+    - delete_repository
+    - delete_branch
+    - force_push
+
+  # Additional CEL expressions, each of which must hold. Written as strings so they are reviewable
+  # in a diff.
+  extraExpressions: []
+
+# Prompt and response checks, in the cluster's own data path. terraform/open-source's
+# gateway_guardrail turns this on and grants the gateway's role bedrock:ApplyGuardrail on it.
+#
+# bedrockGuardrails is a typed processor in the CRD rather than something to wire by hand, so the
+# same guardrail an agent's IAM policy requires can also be enforced here -- two independent layers
+# on one guardrail definition. The IAM condition stops an agent calling the model without the
+# guardrail; this one applies it to traffic the gateway sees whatever the agent asked for.
+promptGuard:
+  enabled: false
+  guardrailIdentifier: ""
+  # A specific version, not DRAFT: requiring DRAFT means the content controls change whenever
+  # somebody edits the guardrail.
+  guardrailVersion: "1"
+
+# Agents permitted to use the gateway at all, as fully qualified service account subjects. Derived
+# from Terraform's agents map in the rendered values file; listed here only to override.
+agents: {}
+
+# IS THE AGENT RESOURCE DEFINITION OWNING PER-AGENT GATEWAY CONFIGURATION?
+#
+# Read, not set, on the path where it matters: the rendered terraform-values.yaml carries the real
+# value, derived as `length(var.agents) == 0`. False here so this chart lints and renders standalone.
+#
+# When true, each `Agent` composes its own model backend and /llm/<name> route (see
+# gitops/base/templates/40-agent-rgd.yaml), so an empty `agents` map below is correct rather than a
+# mistake. When false, the platform team declared agents in Terraform and this chart renders one
+# backend and route per entry.
+agentResource:
+  enabled: false
+
+# THE JUDGE, as a gateway principal (gitops/charts/agent-evals). Rendered by Terraform from
+# enable_evaluations; read, not set, here.
+#
+# Not an agent, and not routed like one. Its own namespace and service account, its own route --
+# /judge/<serviceAccount>, a prefix no Agent can be named into -- and its own backend assuming its own
+# IAM role, which permits the judge model and nothing else. The Gateway-wide authorization binds that
+# route to that one subject the same way it binds /llm/<name> to an agent, and the per-subject token
+# budget meters it like any caller. So grading is a model call that is attributed, budgeted and
+# audited at the gateway, rather than a second credential path around it.
+evals:
+  enabled: false
+  namespace: agent-evals
+  serviceAccount: agent-evals
+  judge:
+    # From Terraform: the role the gateway assumes to sign the judge's calls.
+    roleArn: ""
+    # Empty uses model.bedrockModelId. A judge on a different model from the agents it grades is a
+    # common choice -- a stronger model, or one from another provider to avoid grading itself.
+    bedrockModelId: ""
+
+
+# Acting with a person's own authority (enable_person_access), rendered by Terraform into
+# terraform-values.yaml. `agents` feeds mcp-tool-policy (30-policies.yaml): a call carrying a
+# person's token is allowed only from these agents.
+#
+# tokenExchange (person_access_delegated_token): a call carrying a person's token goes to the
+# mcp-servers-person backend, where the gateway exchanges the person's access token and the agent's
+# own token at the user pool for ONE delegated token, and sends the tool that instead. Every field
+# is Terraform's (terraform/modules/person-delegation); the chart refuses to render with one empty.
+personAccess:
+  enabled: false
+  agents: []
+  # person_access_via_gateway: one S3 route per agent, /aws/<agent>/s3/, signed with the person's
+  # authority for that agent (15-person-aws.yaml). issuer, roleArnPrefix and bucket are the fields
+  # Terraform writes for person access; audience is the api client the person's ID token is for.
+  issuer: ""
+  roleArnPrefix: ""
+  bucket: ""
+  viaGateway:
+    enabled: false
+    audience: ""
+    region: ""
+  tokenExchange:
+    enabled: false
+    tokenUrl: ""
+    clientId: ""
+    secretName: ""
+    secretKey: clientSecret
+    audience: ""
+    actorProvider: ""
+    actorIssuer: ""
+
+# The label the gateway adds to its request metrics naming the calling agent (the verified token's
+# subject). The policy decisions dashboard reads it. Empty: no label, and that dashboard's gateway
+# table shows refusals by route only.
+requestMetrics:
+  callerLabel: agent

@@ -1,0 +1,6 @@
+# Only templates/ is rendered; the rendered values files and the alternatives are not chart files.
+*-values.yaml
+alternatives/
+istio-namespace/
+README.md
+*.md

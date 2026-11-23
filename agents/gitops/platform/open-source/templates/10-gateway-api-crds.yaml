@@ -1,0 +1,65 @@
+{{- if not (has "10-gateway-api-crds.yaml" .Values.excluded) }}
+# Gateway API CRDs.
+#
+# AgentGateway is configured through Gateway API — GatewayClass, Gateway, HTTPRoute — plus its own
+# AgentgatewayBackend and AgentgatewayPolicy resources. Istio's ambient mode needs the same CRDs.
+# Neither chart installs them, so they go in ahead of both.
+#
+# The standard channel, not experimental. Nothing this stack configures needs an experimental
+# resource, and an experimental CRD is a schema that can change under a Gateway object somebody is
+# relying on.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gateway-api-crds
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    # BEFORE the base chart (-10): CRDs and nothing else, so nothing here needs the base chart, and
+    # the base chart's ingress templates need these kinds registered first.
+    argocd.argoproj.io/sync-wave: "-12"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://github.com/kubernetes-sigs/gateway-api.git
+
+    # Pinned. See VERSIONS.md for every pin in this repository and the date each was checked.
+    targetRevision: v1.7.0
+    path: config/crd/standard
+
+  destination:
+    name: eks-agents
+    namespace: kube-system
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      # prune: false on CRDs, deliberately. Pruning a CRD deletes every object of that kind on the
+      # cluster, so a sync that briefly loses sight of this Application would take the Gateway and
+      # every route with it. Removing a CRD is a manual operation.
+      prune: false
+      selfHeal: true
+
+    syncOptions:
+      - ServerSideApply=true
+      # CRDs are large enough to exceed the annotation size limit that client-side apply uses to
+      # store the last-applied configuration. Replace avoids it; ServerSideApply above is what
+      # makes that safe.
+      - Replace=true
+{{- end }}

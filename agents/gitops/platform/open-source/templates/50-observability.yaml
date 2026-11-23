@@ -1,0 +1,594 @@
+{{- if not (has "50-observability.yaml" .Values.excluded) }}
+# Observability on the open source path: Prometheus, Grafana, an OTEL collector, and Langfuse.
+#
+# The instrumentation is the same on both paths — the agent emits OpenTelemetry with the GenAI
+# semantic conventions — so what differs is the backend it lands in, not the agent or its code, and
+# the choice stays reversible.
+#
+# READ THIS BEFORE CHOOSING THIS PATH AT THIS LAYER.
+#
+# Langfuse costs more to run than its name suggests. It stores its traces in ClickHouse, so a team
+# that picks it is also operating a sharded analytical database, a Keeper quorum and the object
+# storage behind them, commonly through the Altinity or ClickHouse operator rather than by hand.
+# That is the real difference between the two paths here: the managed option leaves the platform
+# team no state to run, and this option's heaviest stateful component is ClickHouse.
+#
+# The second thing to know: the metric half of the curated views ships here, and the trace half
+# does not. gitops/charts/agent-dashboards carries a Grafana dashboard over the GenAI semantic
+# conventions — spend per agent and per model as the gateway prices it, tokens, call rate, latency,
+# errors, budget headroom — plus the scrape targets that get those metrics into Prometheus and the
+# recording rules over them. What has no open source equivalent is the per-invocation trajectory and
+# tool-call outcome views, because those are spans rather than metrics.
+#
+# Langfuse is off by default for that reason. Prometheus, Grafana and the collector give the
+# infrastructure and metric half with nothing stateful to operate; turn Langfuse on when the team
+# has decided to own the ClickHouse tier.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 92.21.1
+
+    helm:
+      valuesObject:
+        prometheus:
+          prometheusSpec:
+            # Scrape the agent namespaces' ServiceMonitors and PodMonitors wherever they are, rather
+            # than only ones carrying a release label. An agent's metrics appearing only when
+            # somebody remembered a label is the common failure here.
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+
+            retention: 30d
+
+            # REQUESTS ON EVERY MONITORING POD, because EKS Auto Mode sizes nodes by requests. With
+            # none, Prometheus, Grafana, kube-state-metrics, the operator and the collector can be
+            # packed onto one small node next to the gateway; as Prometheus grows, the node runs out
+            # of memory and its kubelet stops reporting -- NotReady, every pod on it stuck
+            # Terminating, and Prometheus's volume pinned to the dead node. The
+            # limit makes a runaway Prometheus an OOMKill of one pod rather than the loss of a node.
+            resources:
+              requests: { cpu: 200m, memory: 1Gi }
+              limits:   { memory: 3Gi }
+
+            # Persistent, not emptyDir. A Prometheus that loses its data on a pod restart cannot
+            # answer what an agent was doing before the incident, which is the question it exists
+            # for.
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 100Gi
+
+        grafana:
+          # The admin password is not set here, deliberately. A password in a Helm values file is a
+          # password in Git. Point Grafana at the organization's identity provider, or create the
+          # secret out of band -- which is what the reference below does.
+          #
+          # AND `adminPassword: ""` IS NOT THE WAY TO ACHIEVE THAT. An empty value makes the chart
+          # GENERATE A RANDOM PASSWORD ON EVERY RENDER, so the rendered Secret differs from the live
+          # one on every single reconcile. The Application sits permanently OutOfSync on
+          # `Secret/kube-prometheus-stack-grafana` and `Deployment/kube-prometheus-stack-grafana`,
+          # and with selfHeal on it rewrites them forever. That is not cosmetic -- the loop it
+          # creates is indistinguishable from a controller problem until you diff the Secret.
+          #
+          # So reference a secret instead. The chart then generates nothing and the diff is stable.
+          # Create it once, out of band, ahead of the first sync:
+          #
+          #   kubectl -n monitoring create secret generic grafana-admin \
+          #     --from-literal=admin-user=admin \
+          #     --from-literal=admin-password="$(openssl rand -base64 24)"
+          #
+          # Better still, leave `admin` unused and put Grafana behind the organization's identity
+          # provider; this exists so the component can be installed at all without a password in Git.
+          admin:
+            existingSecret: grafana-admin
+            userKey: admin-user
+            passwordKey: admin-password
+
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits:   { memory: 512Mi }
+
+          # Internal only. A Grafana in front of an agent platform holds prompts and tool arguments
+          # in its panels; an internet-facing one is the same exposure as the agent itself.
+          service:
+            type: ClusterIP
+
+          # The chart's Kubernetes dashboards read node-exporter, which is off (below).
+          defaultDashboardsEnabled: false
+
+          sidecar:
+            dashboards:
+              enabled: true
+              searchNamespace: ALL
+              # The dashboards' ConfigMaps name their folder in this annotation
+              # (gitops/charts/agent-dashboards); without these two settings the sidecar ignores it
+              # and files every dashboard under General.
+              folderAnnotation: grafana_folder
+              provider:
+                foldersFromFilesStructure: true
+
+        # The two small ones, for the same reason as prometheusSpec.resources above.
+        kube-state-metrics:
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits:   { memory: 256Mi }
+        prometheusOperator:
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits:   { memory: 256Mi }
+
+        # ONLY WHAT THE AGENT DASHBOARDS READ. The chart's defaults add Alertmanager, a node-exporter
+        # DaemonSet on every node (the agents' sandbox nodes included), and the alerting rules and
+        # Kubernetes dashboards built on them. Nothing in this stack routes an alert or reads a node_
+        # metric: the agent dashboards and cost rules (gitops/charts/agent-dashboards) read the
+        # gateway's GenAI metrics, the collector's strands_ metrics and kube-state-metrics. Turn
+        # these back on when the cluster's own monitoring is meant to live here too.
+        alertmanager:
+          enabled: false
+        nodeExporter:
+          enabled: false
+        defaultRules:
+          create: false
+
+  destination:
+    name: eks-agents
+    namespace: monitoring
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - Replace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: opentelemetry-collector
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  sources:
+    - repoURL: https://open-telemetry.github.io/opentelemetry-helm-charts
+      chart: opentelemetry-collector
+      targetRevision: 0.178.2
+
+      helm:
+        # ONE valuesObject, with the traces exporters and extraEnvs taken from collector-values.yaml
+        # inside it (below). Terraform renders that file from enable_langfuse and the root
+        # Application passes it (collector). Not as a separate `values` block: Argo CD uses
+        # valuesObject INSTEAD of values when both are set, so the exporters would never apply and
+        # the release gate would fail with "never reached the trace backend".
+        valuesObject:
+          image:
+            repository: otel/opentelemetry-collector-contrib
+
+          # A deployment, not a daemonset. The agent's spans are application telemetry reaching an
+          # addressable endpoint, not node telemetry scraped from the host.
+          mode: deployment
+          replicaCount: 2
+
+          # Requested, so Auto Mode sizes a node for it; see prometheusSpec.resources above.
+          resources:
+            requests: { cpu: 50m, memory: 256Mi }
+            limits:   { memory: 512Mi }
+
+          config:
+            receivers:
+              otlp:
+                protocols:
+                  grpc:
+                    # Bound to all interfaces inside the pod, which is what makes the Service reach
+                    # it. The Service is ClusterIP and the collector namespace is not an agent
+                    # namespace, so the network boundary is the policy rather than the bind address.
+                    endpoint: 0.0.0.0:4317
+                  http:
+                    endpoint: 0.0.0.0:4318
+
+            processors:
+              # Batch before export. An agent emitting a span per tool call produces a high request
+              # rate at low volume, which is the pattern batching exists for.
+              batch:
+                timeout: 10s
+                send_batch_size: 1024
+
+              # Drop the attributes that carry content. A span from an agent instrumented with the
+              # GenAI conventions can carry the prompt and the completion, and a metrics pipeline is
+              # not where that should land: it has no retention policy of its own and Prometheus
+              # keeps it as a label.
+              #
+              # The trace pipeline keeps them, because the trace is where a platform team needs to see
+              # what the agent actually did. Retention and access on that backend is the control.
+              attributes/strip_content:
+                actions:
+                  - key: gen_ai.prompt
+                    action: delete
+                  - key: gen_ai.completion
+                    action: delete
+                  - key: gen_ai.request.messages
+                    action: delete
+                  - key: gen_ai.response.messages
+                    action: delete
+
+              memory_limiter:
+                check_interval: 1s
+                limit_percentage: 80
+                spike_limit_percentage: 25
+
+            exporters:
+              # GenAI metrics to Prometheus. This is the pipeline the reference dashboards a team
+              # builds will read.
+              prometheus:
+                endpoint: 0.0.0.0:8889
+                resource_to_telemetry_conversion:
+                  enabled: true
+
+              debug:
+                verbosity: basic
+
+              # Langfuse's OTLP endpoint. DEFINED HERE AND USED BY NO PIPELINE unless enable_langfuse
+              # is true: the traces pipeline's exporters come from collector-values.yaml, which
+              # Terraform renders from that variable. An exporter no pipeline names is never
+              # started, so this costs nothing while Langfuse is absent.
+              #
+              # Authorization is HTTP Basic over the project's API keys, from the langfuse-otlp
+              # Secret terraform/modules/platform-secrets generates alongside the keys Langfuse
+              # initializes its project with. The Secret is optional on the pod, so the collector
+              # starts without it.
+              otlphttp/langfuse:
+                endpoint: http://langfuse-web.langfuse.svc.cluster.local:3000/api/public/otel
+                headers:
+                  Authorization: ${env:LANGFUSE_OTLP_AUTHORIZATION}
+                  # Langfuse v4 ingests OTLP straight into its events table when told the sender is a
+                  # v4 client. Without this header spans can take up to 15 minutes to appear on the
+                  # read API the evaluation runner uses -- long enough that every experiment case
+                  # times out as "never reached the trace backend".
+                  x-langfuse-ingestion-version: "4"
+
+            service:
+              pipelines:
+                metrics:
+                  receivers: [otlp]
+                  processors: [memory_limiter, attributes/strip_content, batch]
+                  exporters: [prometheus]
+
+                traces:
+                  receivers: [otlp]
+                  processors: [memory_limiter, batch]
+                  # From collector-values.yaml, which Terraform renders from enable_langfuse:
+                  # [debug] without Langfuse, [debug, otlphttp/langfuse] with it.
+                  exporters: {{ dig "config" "service" "pipelines" "traces" "exporters" (list "debug") .Values.collector | toJson }}
+
+                logs:
+                  receivers: [otlp]
+                  processors: [memory_limiter, batch]
+                  exporters: [debug]
+
+          # The Langfuse export header's variable, from collector-values.yaml, which Terraform
+          # renders only with enable_langfuse, and there it is NOT optional. As an optional variable,
+          # a collector that starts two seconds before the langfuse-otlp Secret exists runs with it
+          # unset, and Langfuse refuses every span with 401 until the pod is replaced -- the release
+          # gate then fails with "never reached the trace backend". Required, the pod waits for the
+          # Secret instead.
+          {{- with .Values.collector.extraEnvs }}
+          extraEnvs:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+          ports:
+            metrics:
+              enabled: true
+              containerPort: 8889
+              servicePort: 8889
+              protocol: TCP
+
+  destination:
+    name: eks-agents
+    namespace: monitoring
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+# NETWORK POLICY VERDICTS, COUNTED. The agents' NodeClass sets networkPolicyEventLogs: Enabled, so the
+# node's network policy agent writes every ACCEPT and DENY to
+# /var/log/aws-routed-eni/network-policy-agent.log on each agent node, and there is no log store on
+# this path to read it. This collector runs on those nodes only, reads that
+# file, and turns each verdict into a count Prometheus scrapes:
+#
+#   netpol_flow_verdicts_total{verdict, direction, tier}            every flow decision
+#   netpol_flow_denials_total{direction, tier, src, dst, dport, proto}  each refused flow
+#
+# Counts, not records: there is no log backend to keep the lines in, and none is added for this. The
+# denial series names IP addresses, not pods; resolve one with
+#   kubectl get pods -A -o wide --field-selector status.podIP=<src>
+# soon after, because pod addresses are reused. The policy decisions dashboard in
+# gitops/charts/agent-dashboards reads both. Line format, as the node agent writes it:
+# "Flow Info: Src IP: ... Verdict DENY Direction egress, Tier NETWORK_POLICY".
+#
+# ROOT, READ-ONLY. The node agent writes the file as root; the container reads it through a read-only
+# hostPath mount, with every capability dropped and a read-only root filesystem. It opens no port but
+# its metrics, which Prometheus reaches because monitoring is an infrastructure namespace in the
+# agents' cluster network policy.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: netpol-verdicts
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://open-telemetry.github.io/opentelemetry-helm-charts
+    chart: opentelemetry-collector
+    targetRevision: 0.178.2
+
+    helm:
+      valuesObject:
+        fullnameOverride: netpol-verdicts
+        image:
+          repository: otel/opentelemetry-collector-contrib
+        mode: daemonset
+
+        # Only the agents' nodes write verdicts (their NodeClass); the general-purpose NodeClass
+        # leaves event logs off.
+        nodeSelector:
+          karpenter.sh/nodepool: eks-agents
+        tolerations:
+          - key: eks-agents/dedicated
+            operator: Equal
+            value: "true"
+            effect: NoSchedule
+
+        podSecurityContext:
+          runAsUser: 0
+          runAsGroup: 0
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+
+        extraVolumes:
+          - name: netpol-log
+            hostPath:
+              path: /var/log/aws-routed-eni
+              type: Directory
+        extraVolumeMounts:
+          - name: netpol-log
+            mountPath: /var/log/aws-routed-eni
+            readOnly: true
+
+        resources:
+          requests: { cpu: 20m, memory: 64Mi }
+          limits:   { memory: 256Mi }
+
+        # Nothing listens but the metrics port: the chart's default OTLP, Jaeger and Zipkin ports
+        # (host ports, in daemonset mode) are all closed.
+        ports:
+          otlp: { enabled: false }
+          otlp-http: { enabled: false }
+          jaeger-compact: { enabled: false }
+          jaeger-thrift: { enabled: false }
+          jaeger-grpc: { enabled: false }
+          zipkin: { enabled: false }
+          metrics: { enabled: false }
+          verdicts:
+            enabled: true
+            containerPort: 8890
+            servicePort: 8890
+            protocol: TCP
+
+        # alternateConfig, NOT config: config is merged over the chart's defaults, and a null in
+        # Argo CD's valuesObject does not remove a default, so the OTLP, Jaeger and Zipkin receivers
+        # kept starting. alternateConfig replaces the whole configuration.
+        alternateConfig:
+          extensions:
+            # The chart's probes need it.
+            health_check:
+              endpoint: ${env:MY_POD_IP}:13133
+          receivers:
+            filelog/netpol:
+              include: [/var/log/aws-routed-eni/network-policy-agent.log]
+              start_at: end
+              operators:
+                - type: filter
+                  expr: 'not (body matches "Flow Info")'
+                - type: regex_parser
+                  parse_from: body
+                  regex: 'Src IP: (?P<src>[0-9.]+) Src Port: (?P<sport>\d+) Dest IP: (?P<dst>[0-9.]+) Dest Port: (?P<dport>\d+) Proto (?P<proto>\w+) Verdict (?P<verdict>\w+) Direction (?P<direction>\w+), Tier (?P<tier>\w+)'
+          connectors:
+            count:
+              logs:
+                netpol.flow.verdicts:
+                  description: Network policy flow decisions on the agents' nodes, by verdict
+                  attributes:
+                    - key: verdict
+                      default_value: unknown
+                    - key: direction
+                      default_value: unknown
+                    - key: tier
+                      default_value: unknown
+                netpol.flow.denials:
+                  description: Network policy denials on the agents' nodes, by flow
+                  conditions:
+                    - 'attributes["verdict"] == "DENY"'
+                  attributes:
+                    - key: direction
+                      default_value: unknown
+                    - key: tier
+                      default_value: unknown
+                    - key: src
+                      default_value: unknown
+                    - key: dst
+                      default_value: unknown
+                    - key: dport
+                      default_value: unknown
+                    - key: proto
+                      default_value: unknown
+          processors:
+            # THE COUNT CONNECTOR EMITS DELTAS, and the Prometheus exporter keeps only the latest one:
+            # every series reads 1 however often the flow is refused. This turns them into running totals before the exporter
+            # sees them.
+            delta_to_cumulative: {}
+          exporters:
+            prometheus/verdicts:
+              endpoint: ${env:MY_POD_IP}:8890
+              # The exporter forgets a series this long after its last update; the default is 5m, so
+              # a denial that does not recur leaves the dashboard 5 minutes later, and each counter
+              # starts again at 0. 24h covers the
+              # dashboard's default range with room; a collector restart still resets the counts.
+              metric_expiration: 24h
+          service:
+            extensions: [health_check]
+            pipelines:
+              logs:
+                receivers: [filelog/netpol]
+                exporters: [count]
+              metrics:
+                receivers: [count]
+                processors: [delta_to_cumulative]
+                exporters: [prometheus/verdicts]
+
+  destination:
+    name: eks-agents
+    namespace: monitoring
+
+  syncPolicy:
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+# The out-of-box dashboard, and the things it needs to have data in it: the scrape targets for the
+# collector's and the gateway's metrics, and the recording rules over the gateway's spend and token
+# figures.
+#
+# Separate Application from the stack above because it is configuration a platform team edits, and
+# it should be re-syncable without touching Prometheus or Grafana.
+#
+# Sync wave 2: after the collector publishes its metrics port and after kube-prometheus-stack has
+# installed the ServiceMonitor and PrometheusRule CRDs. Applied earlier, both objects are rejected
+# for an unknown kind.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agent-dashboards
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: {{ .Values.repo.url }}
+    targetRevision: {{ .Values.repo.revision }}
+    path: {{ .Values.repo.path }}gitops/charts/agent-dashboards
+
+    helm:
+      valueFiles:
+        - values.yaml
+      # The rendered values (terraform), passed by the root Application.
+      values: |
+        {{- toYaml .Values.terraform | nindent 8 }}
+  destination:
+    name: eks-agents
+    namespace: monitoring
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+{{- end }}

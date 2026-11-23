@@ -1,0 +1,341 @@
+{{- if include "mesh.enabled" . }}
+{{- if .Values.mesh.authz.enabled }}
+{{/*
+Which agents may connect to which, and that traffic reaching the gateway carries a verified
+identity.
+
+Enrolling the reasoning namespace in ambient mode carries an unsandboxed pod's connections over an
+mTLS tunnel stamped with the workload's identity (a pod in a Nitro sandbox isn't captured; see
+below) -- but on its own that says nothing about who may connect to whom. Without a policy here,
+ztunnel authenticates both ends of every in-cluster call and then allows it, so two unsandboxed
+workloads on the same cluster can call each other and neither the network policy nor the gateway is
+in that path: ApplicationNetworkPolicy governs egress out of the namespace, and a call to a peer by
+Service name never leaves it.
+
+So the identity table's "another agent in the same cluster" row is enforced here or nowhere.
+
+WHERE THE RULES BELOW ARE ENFORCED, AND WHAT THAT LIMITS
+--------------------------------------------------------
+Everything in this file is L4, because that is what ambient enforces without a waypoint.
+
+ztunnel is an L4 proxy. It enforces the fields it can decide on a connection --
+source principal, source namespace, destination port -- and it cannot see a request. So:
+
+  principals, namespaces, ports              enforced by ztunnel, no extra component
+  paths, methods, hosts, headers,            require a waypoint proxy, attached with targetRefs
+  requestPrincipals, remoteIpBlocks
+
+Note where requestPrincipals sits. In ambient a rule naming the SUBJECT OF A TOKEN is L7 even
+though it reads like an identity check, which is why every token-based inbound row in the identity
+table needs a waypoint there and the certificate-based one below does not.
+
+So in ambient, what happens to a policy that carries an L7 field anyway depends on its action AND on
+where in the rule the L7 field sits. Four cases, and TWO of them fail open. Istio reports each as a
+warning condition on the policy rather than refusing it:
+
+  ALLOW, ztunnel-targeted    the L7 rules are omitted, so no ALLOW rule matches and the connection
+                             is DENIED. Fails closed -- more restrictive than written
+  DENY, L4 and L7 in the     enforced without the L7 attributes, so it over-blocks. Fails closed.
+  SAME source/operation/     This is the only case the "more restrictive than requested" status
+  when entry                 message describes
+  DENY, L4 and L7 in         the entry carrying the L7 attribute is skipped, so the rule never
+  DIFFERENT entries          matches and traffic is ALLOWED. Fails open
+  DENY with only L7 rules    no enforceable rule is left and the policy HAS NO EFFECT. Fails open
+
+The two fail-open shapes are why scripts/validate.sh refuses ANY L7 AuthorizationPolicy with no
+targetRefs when the mode is ambient -- the check does not try to distinguish same-entry from
+different-entry, because the safe answer is the same either way.
+
+The third case is the one to watch when reading an existing policy: `from.source.principals` plus
+`to.operation.methods` looks like a tightening of a working L4 rule and silently removes it.
+
+Authority: https://istio.io/latest/docs/ambient/usage/l4-policy/ section "Policies with Layer 7
+conditions", which documents all four. Before Istio 1.32.0 the status messages are WRONG -- a DENY
+with only L7 rules reports "more restrictive than requested", which is the opposite of what it
+does. The fix (istio/istio#61126 and PR #61166) is in 1.32.0 and not backported to 1.30.x or
+1.31.x. This stack pins 1.31.4, so the misleading message is what you get: read the table above
+rather than the condition.
+
+THE DEFAULT-DENY GOES FIRST, AND ITS SHAPE IS NOT A DENY
+--------------------------------------------------------
+Istio authorization is deny-by-default only once some ALLOW policy selects a workload: a workload no
+policy selects is open. So a namespace-wide starting point is what makes the allows meaningful, and
+it has to arrive with them -- which it does, being one Helm template.
+
+It is an ALLOW action with NO RULES. That reads wrong and it is the only shape that works.
+
+DO NOT WRITE IT AS `action: DENY` WITH `rules: [{}]`. A DENY with no conditions does match
+everything and is evaluated first -- both halves are true, and together they are fatal: order of
+evaluation is DENY before ALLOW and a matching DENY WINS, so a catch-all DENY denies every
+connection and NO ALLOW POLICY CAN EVER TAKE EFFECT. The namespace is not default-denied, it is
+closed, and every allowlist below is decoration.
+
+With a catch-all DENY in place, an ALLOW policy that matches the traffic -- selectorless on the
+destination port, or with a selector naming the caller's principal -- still fails to admit it:
+
+  error="connection closed due to policy rejection: explicitly denied by: <ns>/<the catch-all deny>"
+
+With the allow-nothing ALLOW below instead, the port rule admits the connection, and a connection no
+rule admits is refused by deny-by-default:
+
+  error="connection closed due to policy rejection: allow policies exist, but none allowed"
+
+So: `action: ALLOW` with no `rules` selects every workload in the namespace and allows nothing,
+which is what establishes the floor, and the rules below are then free to match. There is no
+precedence between two ALLOW policies -- a connection one allows is allowed whatever the other says,
+which is why each ALLOW here is scoped as narrowly as the mode permits.
+
+A CATCH-ALL DENY IS STILL THE RIGHT TOOL for a destination nothing may reach, because there the
+intent is "closed" rather than "closed except". It is wrong only as a default-deny.
+
+WHAT THE RULES BELOW DO NOT COVER: A WORKLOAD IN A NITRO SANDBOX
+----------------------------------------------------------------
+A pod running under `runtimeClassName: isolated-sandbox` is NOT in ztunnel's path for its own
+outbound traffic, whatever the mesh labels say. ztunnel's access log for the same source workload
+with and without the runtime class:
+
+  without the sandbox   dst.addr=<ip>:15008  dst.hbone_addr=<ip>:8080
+                        src.identity="spiffe://cluster.local/ns/<ns>/sa/<sa>"  dst.identity="..."
+  with the sandbox      dst.addr=<ip>:8080   no hbone_addr, NO src.identity, NO dst.identity
+
+The pod still carries `ambient.istio.io/redirection: enabled`, and ztunnel still lists it with
+`protocol: HBONE` in its workload table. Neither is evidence of capture.
+
+Three consequences, and they are the reason this section exists rather than a footnote:
+
+  1. A rule naming `principals` CANNOT MATCH a sandboxed caller, because the connection carries no
+     source identity. Against an unsandboxed destination it fails closed -- the destination's
+     ztunnel captures the inbound plaintext and reports "allow policies exist, but none allowed".
+  2. Between TWO sandboxed pods ztunnel is not in the path at all. No log line on any node, no
+     mTLS, and no authorization decision -- the connection reaches the application.
+  3. PeerAuthentication STRICT below does not reject that plaintext, because ztunnel never sees it.
+
+So for a call to a SANDBOXED agent the control is the agent's own token check in
+apps/reference/server.py, not this file. The mesh rules here remain the control over any
+unsandboxed workload in the namespace, and the second layer for a sandboxed agent calling an
+unsandboxed destination -- which is the gateway, the collector and the session cache.
+
+A WAYPOINT CHANGES WHAT THE PRINCIPAL RULES BELOW SEE (AMBIENT ONLY)
+--------------------------------------------------------------------
+A waypoint does not impersonate the source workload, but it does terminate the connection: once one
+is in the path, the DESTINATION ztunnel sees the waypoint's identity rather than the caller's. So
+every per-caller rule in this file stops matching the moment the reasoning namespace is enrolled
+with a waypoint -- the calls arrive as the waypoint, not as the orchestrator.
+
+That is not a reason to avoid waypoints; it is a reason the two are configured together. Set
+mesh.authz.waypointServiceAccount when you deploy one. It adds the waypoint's principal to the
+allows here, which keeps traffic flowing, and the per-caller decision then belongs on a policy
+attached to the waypoint with targetRefs -- which is where it has to be anyway, because the rows
+that need it are all L7. These ztunnel rules become the coarser second layer: "reaching an agent
+requires coming from the waypoint or ingress".
+
+Leaving it empty on a cluster that has a waypoint is a hard outage, not a silent gap: the deny
+below is L4 and enforced, and nothing will match.
+*/}}
+---
+# Nothing reaches an agent over the mesh unless a rule below names it.
+#
+# ALLOW with no rules, not DENY with an empty rule. An ALLOW action selects every workload in the
+# namespace (no selector) and allows nothing (no rules), which is what makes Istio's deny-by-default
+# apply -- and it leaves the ALLOW policies below free to match. A catch-all DENY would instead win
+# over every one of them; see the header.
+#
+# Pods in this namespace are still reachable from outside the mesh if ztunnel is not in the path --
+# which includes every sandboxed pod, and any pod that started before istio-cni landed on a newly
+# provisioned node. So this is a second layer rather than the floor. The floor is the network policy
+# and the callee's own credential check.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: agents-allow-nothing
+  namespace: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+    # Sync before the allows, so a cluster part-way through a sync is closed rather than open.
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  action: ALLOW
+  # No rules, deliberately. Selects everything, admits nothing.
+---
+# Plaintext is refused, not merely unused.
+#
+# ztunnel already encrypts traffic between enrolled pods, so the mutual TLS is there whatever this
+# says. What STRICT adds is that a connection arriving WITHOUT it is rejected: a pod on a node with
+# no ztunnel, or one deliberately left out of the mesh, cannot reach an agent by talking to it
+# directly. Without this the fallback is permissive and that pod's call succeeds unauthenticated,
+# which also means the AuthorizationPolicy above has no principal to match and the connection is
+# attributed to nothing.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: agents-mtls-strict
+  namespace: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  mtls:
+    mode: STRICT
+{{- if .Values.mesh.authz.allowIngress }}
+---
+# Ingress, and only for the port an agent serves on.
+#
+# A load balancer provisioned by the Gateway API targets the pods directly, and that traffic enters
+# the mesh from outside it -- so with the deny above and nothing here, enabling ingress
+# produces agents that are unreachable through it and reachable by nothing else, which reads as a
+# load balancer fault.
+#
+# This is the one rule in the file with no principal to name, because the ALB is not a mesh
+# workload. Whether the CALLER is anyone in particular is decided at ingress by the OIDC rule
+# on the agent's route, not here. That split is the point of the inbound half of the identity table:
+# the mesh authenticates workloads, and ingress authenticates people.
+#
+# SO THIS RULE IS THE WEAKEST ONE IN THE FILE, and the selector is why it is not also the widest.
+# A rule scoped by destination port and nothing else admits ANY source to that port on EVERY pod in
+# the namespace -- including a caller carrying no identity, which on this stack means any sandboxed
+# pod. Without the selector it would admit any such caller to every agent, and it would do so
+# through the policy meant to let the load balancer in. The selector narrows it to agents that declared expose: route; the Agent resource sets that
+# label from the same field that creates the route.
+#
+# What it still cannot express is "only from outside the mesh". Istio has no such peer, so an
+# unsandboxed workload in this namespace can reach a route-exposed agent's port on this rule, and
+# the agent's own token check is what refuses it. Named here because the ceiling is a property of
+# the mechanism rather than of this configuration.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: agents-allow-ingress
+  namespace: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  selector:
+    matchLabels:
+      eks-agents/ingress: "true"
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports:
+              {{- range .Values.mesh.authz.ingressPorts }}
+              - {{ . | quote }}
+              {{- end }}
+{{- end }}
+---
+# Outbound: an agent may reach the gateway, and that is the whole of its mesh egress.
+#
+# Written as a policy on the gateway's own namespace rather than on the agent's, because Istio
+# authorization is enforced at the destination. A rule "agents may call the gateway" placed in the
+# agents namespace governs calls INTO the agents namespace and does nothing about the gateway.
+#
+# This is the row of the table that says traffic reaching the gateway carries a verified identity.
+# The gateway's own JWT check reads the agent's projected token and decides which agent is calling;
+# this decides, one layer below and on a credential the agent cannot choose, that the connection
+# came from an enrolled agent pod at all. Neither depends on the other being right.
+#
+# TWO PRECONDITIONS, and with either one missing this policy reports Accepted while enforcing
+# nothing:
+#
+#   1. The GATEWAY's namespace has to be enrolled in the mesh. Istio authorization is enforced at
+#      the destination, so a policy on an unenrolled namespace has no proxy to enforce it. That
+#      namespace is created by the agentgateway Application, which labels it through
+#      managedNamespaceMetadata; the base chart cannot, because it does not own it.
+#   2. The CALLER has to be in ztunnel's path. A sandboxed agent is not, so this rule does not match
+#      its traffic even once (1) is fixed -- see the header. What it does govern is any unsandboxed
+#      workload in the cluster trying to reach the gateway, which is the case it was written for.
+#
+# ONCE (1) IS MET, THE SANDBOXED CALL IS REFUSED. A sandboxed agent's call produces no ztunnel
+# access log on any node only while precondition (1) is unmet. Istio enforces authorization at the
+# DESTINATION, so once the gateway's namespace is enrolled, the gateway's own ztunnel does see the
+# connection arrive -- and rejects it:
+#
+#   src.workload="research-..." src.namespace="agents" direction="inbound"
+#   error="connection closed due to policy rejection: allow policies exist, but none allowed"
+#
+# So meeting (1) turns this from an inert policy into an outage: every model call from every
+# sandboxed agent is refused, and the agent sees only
+# `httpx.RemoteProtocolError: Server disconnected without sending a response` with no access log on
+# the gateway and nothing wrong in any resource's status.
+#
+# AND THE POLICY CANNOT BE REPAIRED AS WRITTEN. `source.namespaces` is derived from the caller's
+# mTLS principal, and a Nitro sandbox pod presents none -- so there is no matcher that admits a
+# sandboxed agent by namespace, and an Istio ALLOW policy that matches nothing denies everything.
+# The precondition the comment above calls (2) is not a caveat on this policy; it is a proof that it
+# cannot do its job while agents are sandboxed.
+#
+# So it is OFF by default, and the controls that remain are the ones that actually work on this
+# path:
+#
+#   - the gateway's own JWT authentication, which reads the agent's projected token and is
+#     cryptographic rather than topological -- see gitops/charts/agentgateway-config;
+#   - the cluster-scoped egress policy, which makes the gateway the only destination an agent can
+#     reach at all -- see 30-cluster-egress-policy.yaml.
+#
+# Turn it on only for a cluster whose agents are NOT sandboxed, where the caller does present an
+# identity and the rule can match. On such a cluster it is a genuine second layer.
+{{- if and (eq .Values.path "open-source") .Values.mesh.authz.gatewayAllowAgentsOnly }}
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: gateway-allow-agents-only
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  # SCOPED TO THE DATA PLANE, AND THE SELECTOR IS LOAD-BEARING. Without it this policy applies to
+  # every workload in the namespace, including the gateway's own control plane -- and an Istio ALLOW
+  # policy permits only what its rules match, so namespace-wide it denies everything else.
+  #
+  # With no selector, the data plane cannot reach the control plane's XDS endpoint in its own
+  # namespace --
+  #
+  #   XDS client connection error: gRPC connection error:
+  #   "upstream call failed: Connect: Connection reset by peer", retrying in 15s
+  #
+  # -- so it never receives a route, and every model call fails with a connection reset. The
+  # gateway pods are Running and Ready throughout, the policy reports Accepted, and the agent is
+  # ACTIVE with its backend and route composed. Nothing points at this policy; the only evidence
+  # is the data plane's own log.
+  #
+  # Scoping it to the data plane is also what the policy's name claims: only agents may reach the
+  # LISTENER. The control plane is not a thing agents call, so it has no business being governed by
+  # a rule about who may call agents' model endpoint.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Values.gateway.serviceName }}
+
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            # Namespace rather than a list of principals, deliberately, and it is the looser of the
+            # two. Per-agent authorization at the gateway is the gateway's job and it does it on the
+            # agent's own subject, so restating the agent list here would be a second place to
+            # maintain it with no additional decision made. What this rules out is a workload in
+            # some other namespace reaching the gateway and being attributed to whichever agent's
+            # token it managed to obtain.
+            namespaces:
+              - {{ .Values.namespaces.reasoning }}
+{{- else }}
+# The AWS services path routes to AgentCore Gateway, which is not a workload on this cluster, so
+# there is no destination here to write a policy on. The equivalent control is the gateway's own
+# inbound authentication plus the egress policy that makes it the only reachable host; see
+# gitops/base/templates/30-cluster-egress-policy.yaml. Rendered as a comment rather than omitted so
+# the absence is visible in the diff between the two paths.
+{{- end }}
+{{- end }}
+{{- end }}

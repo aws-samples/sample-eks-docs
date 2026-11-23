@@ -1,0 +1,334 @@
+# The reference MCP server: the tool end of the architecture.
+#
+# The gateway on both paths aggregates MCP servers, and without one there is nothing for an agent's
+# tools/list to return. Source and Dockerfile are in apps/mcp-server.
+#
+# WHAT GATES IT depends on the path (below). Where the server checks tokens (MCP_REQUIRE_TOKEN), an
+# MCP request must carry a projected service account token whose audience is "mcp-server", verified
+# against the cluster's OIDC issuer -- the same kind of token the egress gateway already validates.
+#
+# WHERE IT RUNS: `mcp-servers` (namespace.yaml), UNSANDBOXED, on both paths. It is platform code, so
+# it needs no sandbox, and outside an agent namespace the policy below is its whole ingress set. In
+# `agents` it is open: the Admin-tier policy accepts everything inside an agent namespace
+# (allow-same-namespace, allow-same-namespace-egress), so a gateway-only rule is inert and an agent
+# can call it directly with no token; and a sandboxed server receives no mesh traffic.
+#
+# WHO CALLS IT DEPENDS ON THE PATH, and scripts/render-example.sh renders it (the lines marked
+# `# mcp-require-token`, `# mcp-gateway` and `# mcp-direct`):
+#   open source   AgentGateway, from agentgateway-system, over the mesh. Token check off: the gateway
+#                 authenticates the agent and forwards no token.
+#   aws services  the agents themselves, directly: AgentCore Gateway runs outside the cluster and
+#                 cannot reach a ClusterIP Service. Token check ON, because it is the access control:
+#                 the policy below admits the agent namespace on 8080, and an Agent reaches this
+#                 namespace only when it sets mcpAudience (the Agent definition's mcpPolicy).
+#
+# WHAT REACHES IT. A ClusterIP Service, and nothing else. There is no route and no load balancer in
+# front of this, so it is reachable from inside the cluster only -- which is why the container's
+# bind address is not the exposure boundary, the Service is.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-server
+  namespace: mcp-servers   # mcp-namespace
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app: mcp-server
+# This server verifies inbound tokens and makes no outbound call of its own, so it needs no AWS
+# identity and no Kubernetes API access.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-server
+  namespace: mcp-servers   # mcp-namespace
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    # AgentGateway selects its MCP targets by label, so this is what mcpServers.<name>.
+    # serviceSelector in gitops/charts/agentgateway-config matches.
+    app: mcp-server
+spec:
+  type: ClusterIP
+  selector:
+    app: mcp-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+
+      # THE LABEL SELECTOR IS NOT ENOUGH. AgentGateway selects the Service by label and then picks
+      # the PORT to speak MCP on by this field, so a matched Service with no `appProtocol` on its
+      # port contributes zero targets. With the selector correct, the Service labelled, the
+      # namespace labelled, the Backend `Accepted: True` and the HTTPRoute `ResolvedRefs: True`,
+      # every call still fails
+      #
+      #   http.status=503 protocol=mcp error="mcp: no backends configured" reason=MCP
+      #
+      # and nothing in any object's status says why -- the resolution that comes up empty is the
+      # port scan, which has no condition of its own. The AgentgatewayBackend CRD's own field
+      # description is the only place this is stated:
+      #
+      #   Selected `Service` ports must set `appProtocol: agentgateway.dev/mcp` for streamable
+      #   HTTP or `appProtocol: agentgateway.dev/mcp-sse` for SSE.
+      #
+      # `agentgateway.dev/mcp` is Streamable HTTP, which is what this server speaks and what the
+      # MCP spec has replaced the SSE transport with. Use `-sse` only for a legacy SSE server.
+      appProtocol: agentgateway.dev/mcp
+---
+# WHO MAY REACH THE SERVER ON THE NETWORK: the gateway on the open source path (the rules tagged
+# `# mcp-gateway`), the `agents` namespace on the AWS services path (`# mcp-direct`).
+#
+# In `mcp-servers` this is the only policy that selects these pods, so its rules are the whole
+# ingress set: on the open source path, the gateway's namespace, on the application port and on
+# HBONE 15008 (the port a meshed caller arrives on once namespace.yaml's enrolment label is acted
+# on). In `agents` it would be inert -- the namespace-wide and Admin-tier allows union with it --
+# which is why the server does not run there.
+#
+# Named `-ingress`, not `-allow-gateway`, because on the AWS services path it admits agents and no
+# gateway.
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ApplicationNetworkPolicy
+metadata:
+  name: mcp-server-ingress
+  namespace: mcp-servers   # mcp-namespace
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  podSelector:
+    matchLabels:
+      app: mcp-server
+
+  # Ingress only. Listing Egress as well would replace this server's outbound allowance with this
+  # policy's -- which is empty -- and union semantics do not save you there: the namespace policy
+  # already restricts egress, and adding a second Egress policy that permits nothing still leaves
+  # the union of the two, but it is a trap worth not walking into. This server makes no outbound
+  # call of its own, so there is nothing to grant.
+  policyTypes:
+    - Ingress
+
+  ingress:
+    # The gateway's namespace. A namespaceSelector rather than a podSelector because the gateway
+    # pod's labels are the gateway chart's to change; the mesh AuthorizationPolicy above is what
+    # pins the caller to one identity, and that is the control that should be precise. This layer
+    # only has to get the packets to the port.
+    #
+    # `agentgateway-system` is hardcoded because this example is plain YAML. If the gateway was
+    # installed into a different namespace, change it here.
+    - from:   # mcp-gateway
+        - namespaceSelector:   # mcp-gateway
+            matchLabels:   # mcp-gateway
+              kubernetes.io/metadata.name: agentgateway-system   # mcp-gateway
+      ports:   # mcp-gateway
+        # 15008, NOT 8080 -- AND THIS IS THE WHOLE POINT OF THE RULE.
+        #
+        # In an ambient mesh the application port is INSIDE the tunnel. The gateway's ztunnel does
+        # not open a connection to 8080 on this pod; it opens one to HBONE port 15008 on the
+        # destination's ztunnel, which decrypts and forwards to 8080 inside the pod's own network
+        # namespace, where no NetworkPolicy sees it. So a policy naming only the app port matches
+        # nothing and the tunnel is dropped.
+        #
+        # A rule naming 8080 alone changes nothing, and ztunnel's own log says so outright, which
+        # is where to settle this rather than inferring it from the policy:
+        #
+        #   dst.addr=<pod-ip>:15008 dst.hbone_addr=<pod-ip>:8080
+        #   direction="outbound" bytes_sent=0 bytes_recv=0 duration="10001ms"
+        #   error="connection timed out, maybe a NetworkPolicy is blocking HBONE port 15008"
+        #
+        # Note `dst.addr` and `dst.hbone_addr` are different ports in that one line: the real
+        # connection and the tunnelled intent. Nothing on the destination pod, the Service, or any
+        # policy's status reflects this -- the ztunnel access log on the SOURCE node is the only
+        # place the distinction appears.
+        #
+        # ALLOWING 15008 IS NOT A WIDER GRANT THAN ALLOWING 8080. Everything arriving on 15008 is
+        # mTLS that ztunnel terminates and then authorizes against the AuthorizationPolicy in
+        # mesh-authz.yaml,
+        # so the identity check still pins the caller to `sa/egress`. The two layers do different
+        # jobs: this one admits the tunnel from one namespace, that one decides who inside it may
+        # be served.
+        - { protocol: TCP, port: 15008 }   # mcp-gateway
+
+        # The plaintext app port, kept for a caller that is NOT in the mesh and so reaches 8080
+        # directly -- there is none on this path, and leaving it out would make adding one
+        # fail the same opaque way. Harmless while every caller is meshed: an unmeshed caller still
+        # has to get past this server's own bearer-token check.
+        - { protocol: TCP, port: 8080 }   # mcp-gateway
+
+    # AWS SERVICES: the agents, directly, on the app port. Sandboxed agents are not in the mesh, so
+    # there is no tunnel and no HBONE port; the server's own token check (MCP_REQUIRE_TOKEN) decides
+    # whether the caller may be served. Rendered on aws-services only. `agents` is the agent
+    # namespace in gitops/base values.yaml (namespaces.reasoning); change it here if yours differs.
+    - from:   # mcp-direct
+        - namespaceSelector:   # mcp-direct
+            matchLabels:   # mcp-direct
+              kubernetes.io/metadata.name: agents   # mcp-direct
+      ports:   # mcp-direct
+        - { protocol: TCP, port: 8080 }   # mcp-direct
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server
+  namespace: mcp-servers   # mcp-namespace
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app: mcp-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mcp-server
+  template:
+    metadata:
+      labels:
+        app: mcp-server
+        app.kubernetes.io/part-of: eks-agents-paved-paths
+        eks-agents-ai-docs: "true"
+    spec:
+      serviceAccountName: mcp-server
+      automountServiceAccountToken: false
+
+      enableServiceLinks: false
+
+      # NOT SANDBOXED, on either path. It is platform code, and a sandboxed pod receives no mesh traffic
+      # (the open source gateway reaches it over the mesh). See the agents-mesh page of the EKS User
+      # Guide.
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: mcp
+          # REPLACE: the image built from apps/mcp-server, by scripts/build-images.sh or from apps/ with
+          #   docker build -f mcp-server/Dockerfile -t "$ECR:v1" .
+          image: ACCOUNT.dkr.ecr.REGION.amazonaws.com/agents/mcp-server:v1
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            # WHETHER THE SERVER CHECKS THE CALLER'S TOKEN, and it depends on who the caller is.
+            #
+            # OPEN SOURCE: off. Agents reach the server THROUGH THE GATEWAY's /mcp route, and the
+            # gateway authenticates the agent and forwards the request WITHOUT the caller's bearer
+            # token, so there is nothing to check. What admits only the gateway is the
+            # AuthorizationPolicy and the ApplicationNetworkPolicy below -- both enforced by
+            # infrastructure rather than by this process. Don't set `mcpAudience` on an Agent that
+            # goes through the gateway: it would present an mcp-server token to the GATEWAY, whose
+            # JWT check rejects it (error="authentication failure: ... Error(InvalidAudience)",
+            # reason=JwtAuth, with no jwt.sub) before anything is forwarded.
+            #
+            # AWS SERVICES: on. Agents reach this server directly (`mcpAudience` on the Agent), and
+            # the network policy admits the whole agent namespace on 8080, so this check is the
+            # access control.
+            #
+            # TRUE HERE, AND scripts/render-example.sh RENDERS false ON THE OPEN SOURCE PATH ONLY, so
+            # the manifest fails closed when it is applied unrendered: with it false, the server
+            # gives its tool catalogue to any pod that can reach it, with no token or a bad one.
+            - name: MCP_REQUIRE_TOKEN
+              value: "true"   # mcp-require-token
+            # Read only when MCP_REQUIRE_TOKEN is true. The server's own name, because on a direct
+            # connection the agent projects a token for exactly this audience.
+            - name: MCP_INBOUND_AUDIENCE
+              value: mcp-server
+            # REPLACE with oidcIssuerUrl from your path's rendered terraform-values.yaml. The server
+            # refuses to start without it, rather than serving tools to unverified callers.
+            - name: CLUSTER_OIDC_ISSUER
+              value: "OIDC_ISSUER_NOT_SET"
+            - name: CLUSTER_NAME
+              value: "CLUSTER_NOT_SET"
+            # ACTING FOR A PERSON (enable_person_access). my_account and get_account answer only for
+            # the person whose token comes in x-person-token, verified against this issuer for one
+            # of these clients. scripts/render-example.sh fills both from personAccess in the
+            # rendered values, and leaves them empty with it off -- then those two tools are not
+            # listed at all.
+            - name: PERSON_TOKEN_ISSUER
+              value: ""   # person-token-issuer
+            - name: PERSON_TOKEN_CLIENT_IDS
+              value: ""   # person-token-client-ids
+            # The agents that may act for a person with these tools, as workload subjects, from
+            # person_access_agents. Checked when this server verifies its caller (the AWS services
+            # path); empty there, with the person tools on, no agent may.
+            - name: PERSON_ACCESS_AGENTS
+              value: ""   # person-access-agents
+            # ONE DELEGATED TOKEN (person_access_delegated_token). The open source gateway, or the
+            # agent through AgentCore Identity on the AWS services path, exchanges the person's and
+            # the agent's tokens for one the user pool signs; these two are its audience and the
+            # issuer its actor (act) must name. Filled from
+            # personAccess.tokenExchange; empty with it off. Set, the person tools accept only that
+            # token, and check its act.sub against PERSON_ACCESS_AGENTS behind the gateway too.
+            - name: PERSON_DELEGATED_AUDIENCE
+              value: ""   # person-delegated-audience
+            - name: PERSON_ACTOR_ISSUER
+              value: ""   # person-actor-issuer
+            # Which Cognito client is which agent, on the AWS services path, where each agent's
+            # delegated token comes from AgentCore Identity with the agent's own client as the actor:
+            # client-id=system:serviceaccount:<namespace>:<agent>, comma-separated. Empty on the
+            # open source path, whose actor is the agent's own service account token.
+            - name: PERSON_ACTOR_CLIENTS
+              value: ""   # person-actor-clients
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+
+          # EXEC, NOT httpGet, AND THIS IS NOT A STYLE CHOICE.
+          #
+          # Enrolling a namespace in Istio ambient mode breaks kubelet HTTP probes on this platform:
+          # the probe is a plain connection from the node, ztunnel captures it, and it fails. The pod
+          # then starts, serves correctly, fails its probe and is killed -- a healthy server in the
+          # logs and "context deadline exceeded" in the events.
+          #
+          # The ambient label alone is the cause, layer by layer: no policies -> Ready; Admin-tier
+          # ClusterNetworkPolicy -> Ready; namespaced ApplicationNetworkPolicy -> Ready; add the
+          # ambient label -> NOT Ready, including a pod that is already Ready; the authorization
+          # policy and STRICT mTLS make no difference; remove the ambient label -> Ready again.
+          #
+          # An exec probe is unaffected because the kubelet runs the command inside the container,
+          # so there is no connection for ztunnel to capture: the same pod with an exec probe is
+          # Ready while enrolled.
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import sys, urllib.request
+                  sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8080/healthz", timeout=3).status == 200 else 1)
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import sys, urllib.request
+                  sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8080/healthz", timeout=3).status == 200 else 1)
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { memory: 512Mi }
+
+      volumes:
+        - name: tmp
+          emptyDir: {}

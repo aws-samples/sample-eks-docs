@@ -1,0 +1,9 @@
+apiVersion: v2
+name: consent-receiver
+description: >-
+  An OAuth consent receiver for third-party credentials on both paths: a person approves once, and
+  the gateway attaches the resulting token (open source: stored in the destination's Secrets Manager
+  secret; AWS services: AgentCore completes the session binding). Reached only through kubectl
+  port-forward. See apps/consent-receiver/app.py.
+type: application
+version: 0.1.0

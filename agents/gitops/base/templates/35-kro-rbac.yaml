@@ -1,0 +1,210 @@
+{{- if and .Values.agentResource.enabled .Values.capabilities.kro.roleName }}
+{{/*
+The Kubernetes RBAC the managed kro capability needs to compose an agent.
+
+THIS IS A REQUIRED STEP AND ITS ABSENCE IS NOT OBVIOUS.
+
+The EKS Capability for kro arrives able to watch ResourceGraphDefinitions and their instances, and
+nothing else. It cannot create the resources an RGD composes, and it cannot establish a watch on the
+custom kind the RGD defines. Without the binding below, the Agent resource definition reaches:
+
+  GraphAccepted=True        the graph and schema are valid
+  GraphRevisionsResolved=True
+  KindReady=True            the Agent CRD exists and is served
+  ControllerReady=False     cache sync timeout for agents.eks.amazonaws.com/v1alpha1
+  state: Inactive
+
+Which is the worst shape a failure can take on this stack: `kubectl get crd` shows the Agent kind,
+`kubectl explain agent` works, an Agent resource is accepted by the API server — and nothing
+reconciles it. The agent never appears and no error points at RBAC.
+
+  https://docs.aws.amazon.com/eks/latest/userguide/capabilities-security.html
+
+The capability's Kubernetes user is the assumed-role ARN with the session name /KRO, uppercase,
+which EKS sets. It is not the IAM role ARN, and a binding written against the role ARN silently
+matches nothing.
+
+The AWS documentation's own example binds cluster-admin. This does not. The ClusterRole below names
+each kind the resource definition composes and no others — which matters because this grant is what
+lets an off-cluster service create workloads on the cluster. Widening it to cluster-admin would make
+the kro capability the most privileged principal on an agent platform, to save listing its kinds.
+
+Extend the rules below when you extend the resource definition. A kind added to the RGD and not
+added here fails the same silent way: the Agent instance can report Ready=True with "all resources
+are created and ready", the graph's topological order lists the new resource, and the object does
+not exist. Nothing mentions permissions.
+
+The EKS troubleshooting guidance names this as its second scenario, "Instances created but
+underlying resources not appearing", with RBAC as the cause. Its remedy is to associate
+AmazonEKSClusterAdminPolicy with the capability's access entry. That works and it makes an
+off-cluster AWS service the most privileged principal on the cluster, so this file enumerates
+instead -- at the cost of being a list somebody has to remember to extend.
+
+If that trade is the wrong one for your platform, the honest alternative is to generate this
+ClusterRole from the resource definition rather than maintaining it by hand, because the failure
+mode of forgetting is silent and the failure mode of over-granting is not.
+
+Note also that the capability runs off-cluster, so there is no controller pod whose logs explain
+this. Configure capability controller log delivery before you need it:
+https://docs.aws.amazon.com/eks/latest/userguide/capabilities-controller-logs.html
+*/}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: eks-agents-kro-composer
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+rules:
+  # 1. The custom kind the resource definition defines. Without watch and list here, the controller
+  #    cannot build its cache and never becomes ready -- which is the failure described above.
+  - apiGroups: ["agents.eks.amazonaws.com"]
+    resources: ["agents", "agents/status"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+
+  # 2. The ServiceAccount, with token mounting turned off.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # 3. The workload.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The default runtime: one Agent Sandbox `Sandbox` per Agent (runtime: sandbox). kro composes
+  # either this or the Deployment above, never both. Without this grant kro accepts the graph and
+  # the Sandbox is never created, with the Agent reporting nothing useful -- the silent RBAC
+  # failure every composed kind has.
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # 3b. How the agent is reached: the Service, its route on the shared Gateway, and the OIDC rule.
+  #
+  # The Gateway and the GatewayClass are deliberately NOT here. kro composes a route that attaches
+  # to the Gateway; it cannot edit the Gateway, which is what keeps the scheme, the certificate and
+  # the listener out of reach of anything an agent author can trigger.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # EVERY RULE BELOW IS UNCONDITIONAL, though each kind is composed only when its component is on.
+  # kro lists every kind an instance ever composed when it deletes the instance, so a rule that goes
+  # away with its component leaves each Agent composed while it was on undeletable: "deletion
+  # blocked: list deletion inventory: ... targetgroupconfigurations.gateway.k8s.aws is forbidden"
+  # once ingress is turned off, and teardown waits out its timeout on every such Agent.
+  # RBAC does not validate against installed CRDs, so a rule for an absent kind grants nothing.
+  #
+  # HTTPRoutes are composed in TWO cases, not one: ingress route when an agent sets
+  # `expose: route`, and the /llm/<agent> egress route that every agent with model access gets. So
+  # the rule is not guarded on `ingress.enabled`: a cluster with ingress off -- the default -- still
+  # composes a model route.
+  #
+  # RBAC does not validate against installed CRDs, so granting these on a cluster without Gateway
+  # API would be harmless. They are enumerated rather than cluster-admin so this ClusterRole stays a
+  # readable statement of what kro creates.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # The agent's own model backend, composed into the gateway's namespace. Without it the agent
+  # reports state=ERROR with a forbidden on agentgatewaybackends, and the model call it was supposed
+  # to make disconnects without a response. kro does surface this on the Agent's own conditions --
+  # it is not silent -- but nothing in the gateway or the Deployment mentions it.
+  # Only composed on the open source path; see 40-agent-rgd.yaml.
+  - apiGroups: ["agentgateway.dev"]
+    resources: ["agentgatewaybackends"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # The two model failover policies, composed when the platform configures fallback models
+  # (model.fallbackModelIds).
+  #
+  # UNGATED, deliberately: a rule gated on `fallbackModelIds` breaks the moment anything else in the
+  # graph composes this kind, and an Agent composed while it was on cannot be deleted without it.
+  #
+  # SAME TRAP AS THE BACKEND ABOVE, one kind along: adding a resource to the graph without adding it
+  # here leaves the Agent at state=ERROR with
+  #
+  #   agentgatewaypolicies.agentgateway.dev "model-failover-health-<agent>" is forbidden:
+  #   User ".../<cluster>-capability-kro/KRO" cannot get resource "agentgatewaypolicies"
+  #
+  # and NOTHING ELSE composed -- not the backend, not the route, not the Deployment, because kro
+  # stops the whole instance on the first forbidden. Without this rule, enabling `fallbackModelIds`
+  # takes a working agent to ERROR.
+  #
+  # The lesson generalises: every kind the resource definition composes needs a rule here, and the
+  # failure arrives as a forbidden on the Agent rather than anywhere near the thing that is missing.
+  - apiGroups: ["agentgateway.dev"]
+    resources: ["agentgatewaypolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # THE INGRESS COMPONENT'S OWN KINDS, granted whatever else is on. A cluster with ingress on that
+  # lacked these would compose a gate kro is not allowed to create -- the agent reports
+  # ResourcesReady=False and the route never gets its rule.
+  #
+  # referencegrants: a browser-gated route lives in namespaces.ingress and reaches the agent's
+  # Service through a ReferenceGrant kro composes in the agent's namespace.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["referencegrants"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["gateway.k8s.aws"]
+    # EVERY COMPOSED KIND NEEDS ITS OWN LINE HERE. kro composes as the user bound below, so a kind
+    # missing from this list fails at reconcile with "cannot get resource ..." and the agent reports
+    # ResourcesReady=False -- after the graph has already been accepted, which is the misleading
+    # part: the RGD is valid, the object is simply never created. Adding a resource to
+    # 40-agent-rgd.yaml without adding it here is the recurring mistake.
+    #
+    # targetgroupconfigurations carries the health check path and pins `ip` targets; without it the
+    # check defaults to `/`, the agent answers 404, and an exposed agent is permanently unhealthy.
+    resources: ["listenerruleconfigurations", "targetgroupconfigurations"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # 4. The agent's own network policy. The second layer, inside the namespace; the boundary itself is
+  #    the cluster-scoped policy, which kro is deliberately NOT granted — an off-cluster composer
+  #    that could edit the Admin-tier egress policy could widen what every agent reaches.
+  - apiGroups: ["networking.k8s.aws"]
+    resources: ["applicationnetworkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # A task agent's ScaledJob (runtime: tasks). KEDA, not kro, creates the Jobs from it.
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # 5. The AWS resources, through ACK. kro creates the custom resources; the ACK capability is what
+  #    turns them into an IAM role and a Pod Identity association, under its own scoped IAM policy.
+  #    So kro holds no AWS permission at all: it writes Kubernetes objects, and the authority to
+  #    create an IAM role lives in the ACK capability role's policy and nowhere else.
+  - apiGroups: ["iam.services.k8s.aws"]
+    resources: ["roles", "roles/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  - apiGroups: ["eks.services.k8s.aws"]
+    resources: ["podidentityassociations", "podidentityassociations/status"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Events, so a failure to compose is visible with `kubectl describe agent` rather than only in a
+  # log nobody has.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: eks-agents-kro-composer
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: eks-agents-kro-composer
+subjects:
+  # The session name /KRO is uppercase and set by EKS. Binding the plain IAM role ARN instead
+  # matches nothing, with no error.
+  - kind: User
+    name: arn:{{ .Values.partition }}:sts::{{ .Values.accountId }}:assumed-role/{{ .Values.capabilities.kro.roleName }}/KRO
+    apiGroup: rbac.authorization.k8s.io
+{{- end }}

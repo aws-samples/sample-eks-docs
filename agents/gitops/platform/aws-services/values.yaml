@@ -1,0 +1,19 @@
+# Set by the root Application, which scripts/bootstrap-gitops.sh builds from the files Terraform
+# renders beside this one. Nothing here is account-specific; the account's values reach the cluster
+# only through the root Application, never through Git.
+
+# Where every Application below reads this repository's charts from.
+repo:
+  url: https://github.com/aws-samples/sample-eks-docs.git
+  revision: main
+  path: agents/       # this directory's place in that repository, with a trailing slash
+
+# Platform files left out because their layer is off (Terraform's platform_excluded).
+excluded: []
+
+# The rendered values files, by name: terraform-values.yaml, collector-values.yaml,
+# external-dns-values.yaml and agent-evals-values.yaml.
+terraform: {}
+collector: {}
+externalDns: {}
+agentEvals: {}

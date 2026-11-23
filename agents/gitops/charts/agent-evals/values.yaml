@@ -1,0 +1,162 @@
+# Agent evaluation, with Strands Evals.
+#
+# WHAT THIS RUNS. One image, agents/evals (apps/evals/runner.py), in two modes:
+#
+#   online      A CronJob. Grades a deterministic sample of the sessions that went quiet in the
+#               last window, from Langfuse, and writes each grade back to Langfuse as a session
+#               score named strands.<Evaluator>. OPEN SOURCE PATH ONLY: on AWS, AgentCore
+#               Evaluations' online config (terraform/modules/evaluations-aws) already grades live
+#               traffic, and running both would pay twice for the same grade.
+#   experiment  A SUSPENDED CronJob, so it never runs on a schedule and is run on demand:
+#
+#                 kubectl -n agent-evals create job --from=cronjob/agent-evals-experiment gate-1
+#
+#               It sends each declared case to the deployed agent, fetches that turn's trajectory
+#               from the trace backend by session id, grades it, and exits 1 when the pass rate is
+#               below minPassRate -- which is what makes it a release gate a pipeline can wait on.
+#               Results go to Langfuse on the open source path, and to AgentCore Evaluations'
+#               result log group on AWS, where the GenAI Observability dashboard shows them beside
+#               the managed online evaluation's.
+#
+# WHY A RUNNER AND NOT LANGFUSE-NATIVE EVALUATORS. With a Langfuse-native evaluator, Langfuse calls
+# the judge itself, over an LLM connection holding one static key, and this stack's gateway accepts
+# only a short-lived projected service account token -- so such an evaluator is created and then
+# refused on every call. The runner here is a pod, with its own token, so the gateway can verify it.
+#
+# THE JUDGE IS A GATEWAY PRINCIPAL, not an agent. Its own service account in its own namespace, its
+# own route (/judge/<serviceAccount> on the open source path), its own IAM role scoped to the judge
+# model, and the same per-subject token budget as an agent. Grading is a model call, so it is
+# metered, attributed and audited where every other model call is.
+
+# Rendered by Terraform into terraform-values.yaml. Read, not set, here.
+evals:
+  enabled: false
+  namespace: agent-evals
+  serviceAccount: agent-evals
+  # langfuse on the open source path, agentcore on the AWS services path.
+  backend: ""
+  judge:
+    # The gateway's OpenAI-compatible endpoint for the judge. Open source: the /judge/<sa> route on
+    # the in-cluster gateway. AWS: the same inference endpoint the agents use.
+    baseUrl: ""
+    # The model name sent in the request. The open source gateway's judge backend fixes the Bedrock
+    # model, so this is a label there; on AWS the gateway routes on it, so it must be one the
+    # gateway serves (the same value as model.gatewayModelId).
+    model: ""
+    # The audience of the judge's projected token -- the gateway's.
+    audience: agentgateway
+  agentcore:
+    # The log group the agents' OTLP logs land in, which Strands Evals' CloudWatch provider reads a
+    # session's trajectory from.
+    logGroup: ""
+    region: ""
+    # Results go to /aws/bedrock-agentcore/evaluations/results/<resultsName>.
+    resultsName: ""
+
+# Where the runner may send DNS: the resolver ranges, the same list as networkPolicy.dnsDestinations
+# in gitops/base/values.yaml, which the agents' DNS rule uses (scripts/lib/check_evals.py holds the
+# two equal). Every resolver an EKS pod uses is inside them, CoreDNS included, and a resolver on a
+# public address is not. Not a CoreDNS pod selector: on EKS Auto Mode CoreDNS is managed and its
+# pods are not selectable.
+networkPolicy:
+  dnsDestinations:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - 169.254.0.0/16
+
+registry: {}
+region: ""
+
+image:
+  # Empty means registry["agents/evals"], the ECR repository Terraform creates.
+  repository: ""
+  tag: v1
+  pullPolicy: IfNotPresent
+
+langfuse:
+  # In-cluster Langfuse. The runner reaches it over the cluster network; nothing leaves the cluster.
+  host: http://langfuse-web.langfuse.svc.cluster.local:3000
+  # Project API keys. On the open source path terraform/modules/platform-secrets generates them,
+  # Langfuse creates its project with them at startup (LANGFUSE_INIT_PROJECT_*_KEY), and the Secrets
+  # Store CSI driver projects this copy into the runner's namespace. Nobody clicks a key into a UI.
+  existingSecret: langfuse-evals-api
+  publicKeyRef: public-key
+  secretKeyRef: secret-key
+
+# The graded dimensions, by Strands Evals class name, for both modes. Each runs at its own grain,
+# declared on the class: Session (GoalSuccessRate), Trace (Helpfulness, Faithfulness) or ToolCall
+# (ToolSelectionAccuracy, ToolParameterAccuracy). A handful rather than one, at more than one grain:
+# grading an agent's final answer does not detect a failure that is a wrong action.
+#
+# All of these are reference-free -- they need no expected answer -- which is what lets the same
+# list grade live traffic. A ToolCall evaluator on a turn that called no tool returns
+# not-applicable, and the runner publishes nothing for it rather than a zero.
+evaluators:
+  - Helpfulness
+  - Faithfulness
+  - ToolSelectionAccuracy
+  - ToolParameterAccuracy
+  - GoalSuccessRate
+
+# A team's own dimensions, as OutputEvaluator rubrics. A rubric with a definition per point, so two
+# runs are comparable and a reviewer knows what a score meant.
+rubrics: {}
+  # groundedness:
+  #   rubric: >-
+  #     Score 1.0 if every factual claim in the response is supported by the retrieved context,
+  #     0.5 if a secondary claim is not, 0.0 if a main claim is unsupported.
+
+online:
+  enabled: true
+  # Every 15 minutes, over the 15-minute window that ended quietMinutes ago, so each session is
+  # considered once. concurrencyPolicy Forbid keeps two runs from grading the same window.
+  schedule: "*/15 * * * *"
+  windowMinutes: 15
+  # How long a session must have been quiet before it is graded. A session still in progress graded
+  # now is graded on half a conversation.
+  quietMinutes: 10
+  # Share of sessions graded, 0-100. Every graded session is several judge calls -- one per
+  # evaluator, and one per tool call for the ToolCall ones -- so this is the cost control.
+  samplingPercentage: 10
+  maxSessions: 50
+  maxWorkers: 4
+
+experiment:
+  name: release-gate
+  # The gate. Share of (case, evaluator) grades that must pass.
+  minPassRate: 0.8
+  # How long to wait for a turn's spans to reach the trace backend before calling the case an
+  # execution failure. Two batching exporters and an async ingest sit between the agent and either
+  # backend.
+  traceWaitSeconds: 180
+  turnTimeoutSeconds: 300
+  maxWorkers: 2
+  # Evaluators that need an expected answer, so only the experiment runs them.
+  extraEvaluators:
+    - Correctness
+  rubrics: {}
+
+  # The agents to run cases against, by Agent name. Each needs `expose: cluster` (a Service), and
+  # the runner presents a token minted for that agent's own audience -- one projected volume per
+  # agent, rendered here. Empty renders no experiment CronJob.
+  agents: {}
+    # research:
+    #   namespace: agents
+    #   port: 8080
+    #   # AWS only: the service.name the agent's telemetry carries, which the dashboard groups
+    #   # results under. Defaults to the agent name.
+    #   serviceName: ""
+    #   cases:
+    #     - name: capital
+    #       input: What is the capital of France?
+    #       expectedOutput: Paris
+
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  # A CPU limit as well, so a runaway grading run cannot take a node's CPU from what shares it.
+  limits: { cpu: "1", memory: 1Gi }
+
+# Kept short: a token minted for an agent's audience is a credential to that agent.
+tokenExpirationSeconds: 3600

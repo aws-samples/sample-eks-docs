@@ -1,0 +1,62 @@
+# Written by terraform/aws-services. Do not edit by hand: the next apply overwrites it.
+#
+# The copy in the repository is a placeholder that shows the shape. Every value in it is
+# deliberately invalid rather than plausible: the
+# charts' fail guards refuse to render against these, which is the intended behaviour. A chart that
+# rendered cleanly against placeholders would produce IAM trust policies naming account
+# ACCOUNT_ID_NOT_SET and an egress rule naming a gateway hostname that does not exist, and the
+# cluster would look configured.
+#
+# `terraform apply` in terraform/aws-services writes the rendered file here. It names your account
+# and cluster, and it goes to no repository at all: scripts/bootstrap-gitops.sh folds it into the
+# root Application's helm.values, which is the only way it reaches the cluster. Don't commit it.
+accountId: ACCOUNT_ID_NOT_SET
+cluster: CLUSTER_NOT_SET
+region: REGION_NOT_SET
+path: aws-services
+oidcIssuerUrl: ""
+
+mesh:
+  # `none` or `ambient`. Off on this path unless the team installs the mesh. See
+  # gitops/platform/aws-services/ISTIO-DECISION.md for why. Terraform's mesh_mode sets this AND
+  # leaves 54-istio-namespace.yaml and 55-istio.yaml out of the platform chart's excluded list, so
+  # the two cannot disagree.
+  mode: "none"
+  trustDomain: cluster.local
+
+gateway:
+  url: ""
+  # Required on this path. The egress policy names this hostname as the single destination an agent
+  # may reach, so an empty value makes the chart fail rather than render a policy that permits
+  # nothing and breaks every agent at its first call.
+  hostname: ""
+  arn: ""
+
+  # Required on this path too, from the model_endpoint output. The OpenAI-compatible endpoint an
+  # agent posts a model call to, which exists only once the gateway has an inference target. The
+  # chart fails on an empty value rather than rendering an agent whose OPENAI_BASE_URL is unset.
+  modelEndpoint: ""
+  # From the mcp_endpoint output. The agent's tool client reads this.
+  mcpEndpoint: ""
+
+observability:
+  collectorNamespace: opentelemetry-operator-system
+  collectorServiceAccount: adot-collector
+  collectorRoleArn: ""
+  telemetryLogGroup: ""
+
+memory:
+  sessionStateEndpoint: []
+  vectorBucketArn: ""
+  memoryId: ""
+
+storage:
+  checkpointBucket: ""
+
+agentResource:
+  enabled: true
+  rolePath: /eks-agents/
+  permissionsBoundaryArn: ""
+
+registry: {}
+agents: {}

@@ -1,0 +1,20 @@
+# Rendered by Terraform into terraform-values.yaml: from oauth_consent on the open source path and
+# agentcore_consent on the AWS services path.
+consent:
+  enabled: false
+  namespace: consent
+  serviceAccount: consent-receiver
+  # Where the browser comes back to: the operator's forwarded localhost port. The provider's
+  # registered callback URL must be <publicBaseUrl>/callback/<client>.
+  publicBaseUrl: http://localhost:8765
+  port: 8765
+  # Open source: {client: {authorizeUrl, tokenUrl, clientId, clientSecretArn, scopes, secretId,
+  #                       refreshSecretId}}
+  # AgentCore:   {client: {mode: agentcore, agent, agentNamespace, audience}}
+  clients: {}
+  syncer:
+    namespace: agentgateway-system
+    deployment: platform-secrets-syncer
+region: ""
+registry: {}
+imageTag: v1

@@ -1,0 +1,5 @@
+apiVersion: v2
+name: platform-secrets
+description: Projects the platform's generated secrets from AWS Secrets Manager into the Kubernetes Secrets that third-party charts read, through the Secrets Store CSI driver.
+type: application
+version: 0.1.0

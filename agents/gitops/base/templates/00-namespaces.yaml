@@ -1,0 +1,136 @@
+{{/*
+The namespaces the stack uses, and the labels that decide what happens in each.
+
+Three things are decided here rather than per workload:
+
+  1. Which namespaces the admission policy binds to, through eks-agents/admission: enforce. A
+     namespace without that label is not covered by the sandbox and host-network rules in
+     20-admission-sandbox.yaml, so adding an agent namespace means adding the label.
+  2. Whether the namespace is enrolled in the mesh. With mesh.mode ambient it carries
+     istio.io/dataplane-mode: ambient, which puts the per-node proxy in the network path of the
+     namespace's unsandboxed pods; a pod in a Nitro sandbox isn't captured. With none it carries no
+     mesh label.
+
+     It never carries istio-injection: enabled. Istio resolves a namespace labelled for both data
+     planes in favour of sidecar injection, silently, and an injected pod is refused in an agent
+     namespace (20-admission-sandbox.yaml, rule 5). scripts/validate.sh refuses a rendered namespace
+     carrying it. The agents-mesh page of the EKS User Guide compares the two modes.
+  3. Pod Security Admission, at restricted. This is not the sandbox boundary and does not replace
+     it; it is what refuses the pod shapes that would make the sandbox irrelevant.
+*/}}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app.kubernetes.io/managed-by: argocd
+    eks-agents/tier: reasoning
+
+    # Binds the admission policy. Without this label the policy exists and matches nothing in this
+    # namespace, which is the failure that looks like it worked.
+    eks-agents/admission: enforce
+
+    {{- if include "mesh.isAmbient" . }}
+    # Enrolls the namespace in Istio ambient, so the per-node proxy captures the outbound
+    # connections of this namespace's unsandboxed pods; a pod in a Nitro sandbox isn't captured,
+    # and every Agent runs in one. For a captured pod the mesh carries its connections with a
+    # verified workload identity.
+    istio.io/dataplane-mode: ambient
+    {{- end }}
+
+    # restricted, not baseline. An agent running model-generated code has no case for a privileged
+    # pod, a host mount or an added capability, and the sandbox is a second boundary rather than a
+    # reason to drop this one.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+{{/*
+The execution tier, separate from the reasoning tier.
+
+A separate namespace rather than a label in the same one, for two reasons. The cluster-scoped
+egress policy subjects on namespaces, so the tier that may reach the gateway and the tier that may
+reach nothing are two different subjects. And RBAC is per namespace: whoever can create a pod in
+the reasoning namespace should not thereby be able to create one in the tier that runs untrusted
+code.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces.execution }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app.kubernetes.io/managed-by: argocd
+    eks-agents/tier: execution
+    eks-agents/admission: enforce
+
+    # Deliberately not enrolled in the mesh. These pods boot with no network device, so there is
+    # nothing to capture and a ztunnel entry for a pod with no interface is at best confusing.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+{{- if .Values.ingress.enabled }}
+---
+{{/*
+THE INGRESS COMPONENT'S OWN NAMESPACE: the browser-gated HTTPRoutes and their ListenerRuleConfigurations,
+for every agent and for the chat UI.
+
+They live here rather than beside each agent because a browser gate can need a credential -- the
+client secret of a directly called OIDC provider -- and EKS Auto Mode's managed gateway controller
+needs an RBAC grant to read it. Keeping every such rule here means one Secret, one grant, and no
+agent namespace ever holding either. A route here reaches the agent's Service through a
+ReferenceGrant the Agent resource composes beside that Service.
+
+Deliberately NOT labelled eks-agents/admission: enforce. Nothing that runs here is an agent: the only
+pod is gitops/charts/platform-secrets' syncer, which holds the Secret's CSI mount open and cannot run
+in a Nitro sandbox. Pod Security Admission still enforces restricted, which the syncer meets.
+
+Not enrolled in the mesh either: nothing here sends or receives traffic.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces.ingress }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app.kubernetes.io/managed-by: argocd
+    eks-agents/tier: ingress
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+{{- end }}
+
+{{- if (.Values.evals | default dict).enabled }}
+---
+{{/*
+THE EVALUATION RUNNER'S NAMESPACE (gitops/charts/agent-evals).
+
+Not an agent namespace, and deliberately so: no eks-agents/admission label, because the runner is
+platform code rather than model-driven code, and no mesh enrolment, because every agent it calls is
+in a Nitro sandbox that ztunnel does not capture. What constrains it is the chart's own network
+policy, the gateway's subject check on its token, and each agent verifying the token it presents.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespaces.evals }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app.kubernetes.io/managed-by: argocd
+    eks-agents/tier: evaluation
+
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+{{- end }}

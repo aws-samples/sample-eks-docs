@@ -1,0 +1,65 @@
+# Pinned, not ranged. An agent's dependency set is part of what the sandbox's policy and the image
+# scan are evaluated against, so a rebuild that silently picks up a new minor version changes what
+# was reviewed. See ../../VERSIONS.md.
+#
+# Needs Python 3.10 or newer: strands-agents declares requires_python >=3.10, and on an older
+# interpreter pip reports "no matching distribution" rather than a version conflict, which reads
+# like the package does not exist. The Dockerfile uses 3.13.
+
+# The agent framework. Both paths specify Strands, and the choice is the framework only --
+# nothing about this stack's identity, egress or isolation depends on it, which is the point: an
+# agent written against another framework runs under exactly the same controls.
+# The [openai] extra, not the bare package. The OpenAI-compatible model provider is an optional
+# extra in Strands, and installing the bare package leaves strands.models.openai unimportable --
+# which surfaces as ModuleNotFoundError at startup rather than at install, so a bare pin looks fine
+# until the pod starts. The extra also constrains openai to <4.0.0, which is why the pin below is a
+# 3.x.
+strands-agents[openai]==1.64.0
+
+# Pinned explicitly as well as being pulled by the extra, so the resolved version is recorded here
+# rather than being whatever the extra's range resolves to on the day of the build.
+openai==3.46.0
+
+# OpenTelemetry with the GenAI semantic conventions. The exporter is OTLP on both paths and the
+# endpoint is set per path by the Agent resource, which is what keeps the backend choice reversible
+# without rebuilding the agent.
+opentelemetry-distro==0.66b2
+opentelemetry-exporter-otlp-proto-http==1.45.2
+
+# Deliberately absent:
+#
+#   boto3 / botocore   NOT pinned here, but PRESENT: strands-agents depends on both, for its Bedrock
+#                      model provider, so every image built from this file carries an AWS SDK. The
+#                      default image never calls Bedrock with it -- it has no code path that does --
+#                      but model-generated code running in the pod can import it and use the pod's
+#                      Pod Identity credential. What contains that is the agent's IAM role, scoped to
+#                      its own models and checkpoint prefix, and the network policy, which permits
+#                      only the AWS endpoints networkPolicy names.
+#
+#   strands-agents-tools  The tool catalogue comes from the gateway's aggregated MCP endpoint, so
+#                      tools are a reviewable object in Git rather than a dependency of the image.
+
+# openai's HTTP client, pinned so the image resolves the same version on every build. The agent
+# imports it only for the MCP client's per-request credential (TokenFileAuth). The model call's
+# credential, the pod's projected service account token, goes in api_key as a callable the OpenAI
+# SDK calls before every request (app.py says why an httpx auth hook does not work with this SDK).
+httpx==0.28.1
+
+# The HTTP server in server.py, and the credential check that gates it. PyJWT needs the crypto
+# extra: the cluster's service account tokens are RS256 and the bare package cannot verify a
+# signature, which would leave the gate decoding a token it never checked.
+fastapi==0.165.0
+# fastapi 0.165 needs starlette 1.6 or newer; pinned so the image is the one that was scanned.
+starlette==1.10.0
+uvicorn==0.38.0
+pyjwt[crypto]==2.15.1
+
+# Consolidation (memory rung 3, open source path): Mem0 as a library through its Strands memory
+# store, on the pgvector tier. Off unless the Agent resource sets AGENT_CONSOLIDATION_DB_SECRET_ARN
+# (enable_consolidation), so the default agent never imports it. A library rather than the Mem0
+# server, whose only published image is a stale `latest`. mem0ai brings qdrant-client, sqlalchemy and
+# posthog with it; the pod sets MEM0_TELEMETRY=false and the egress policy refuses PostHog anyway.
+mem0ai==2.2.1
+mem0-strands==0.1.1
+psycopg[binary]==3.3.9
+psycopg-pool==3.3.3

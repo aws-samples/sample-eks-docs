@@ -1,0 +1,34 @@
+{{- if .Values.evals.enabled }}
+{{- $v := .Values }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-evals
+  namespace: {{ $v.evals.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app.kubernetes.io/name: agent-evals
+data:
+  # The one definition of what is graded and how, read by both modes. apps/evals/runner.py
+  # documents every key.
+  config.yaml: |
+    {{- $agents := dict }}
+    {{- range $name, $a := $v.experiment.agents }}
+    {{- $ns := $a.namespace | default "agents" }}
+    {{- $_ := set $agents $name (dict
+          "url" (printf "http://%s.%s.svc.cluster.local:%v/chat" $name $ns ($a.port | default 8080))
+          "tokenFile" (printf "/var/run/secrets/eks-agents/agents/%s/token" $name)
+          "serviceName" ($a.serviceName | default $name)
+          "cases" ($a.cases | default list)) }}
+    {{- end }}
+    {{- $cfg := dict
+          "backend" $v.evals.backend
+          "judge" (dict "baseUrl" $v.evals.judge.baseUrl "model" ($v.evals.judge.model | default "judge") "tokenFile" "/var/run/secrets/eks-agents/gateway/token" "policySessions" (($v.gateway | default dict).policySessions | default false))
+          "evaluators" $v.evaluators
+          "rubrics" $v.rubrics
+          "online" (dict "windowMinutes" $v.online.windowMinutes "quietMinutes" $v.online.quietMinutes "samplingPercentage" $v.online.samplingPercentage "maxSessions" $v.online.maxSessions "maxWorkers" $v.online.maxWorkers)
+          "experiment" (dict "name" $v.experiment.name "minPassRate" $v.experiment.minPassRate "traceWaitSeconds" $v.experiment.traceWaitSeconds "turnTimeoutSeconds" $v.experiment.turnTimeoutSeconds "maxWorkers" $v.experiment.maxWorkers "extraEvaluators" $v.experiment.extraEvaluators "rubrics" $v.experiment.rubrics "agents" $agents)
+          "agentcore" (dict "logGroup" $v.evals.agentcore.logGroup "region" ($v.evals.agentcore.region | default $v.region) "resultsName" ($v.evals.agentcore.resultsName | default $v.experiment.name)) }}
+    {{- toYaml $cfg | nindent 4 }}
+{{- end }}

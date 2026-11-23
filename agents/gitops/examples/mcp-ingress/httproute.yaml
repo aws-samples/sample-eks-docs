@@ -1,0 +1,80 @@
+# An agent's route on the shared ingress.
+#
+# This is the hand-written form of what the Agent resource composes when you set expose: route. It is
+# here for the case the resource does not cover: an agent that needs path rewriting, header
+# manipulation, traffic splitting across versions, or more than one hostname.
+#
+# The Gateway and the GatewayClass are NOT here. They are in gitops/base, owned by the platform team,
+# which is the whole reason this is Gateway API rather than Ingress: with Ingress the scheme, the
+# certificate and the load balancer attributes were annotations on this object, so an agent author
+# editing their own route could make ingress internet-facing. Here they cannot — this file
+# attaches to a listener and can do nothing else.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: research
+  namespace: agents
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  parentRefs:
+    # The shared Gateway. One load balancer for every agent: a Gateway IS a load balancer, so a
+    # Gateway per agent would be an ALB per agent.
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: agent-ingress
+      namespace: agents
+      sectionName: https
+
+  hostnames:
+    # Has to be covered by the ACM certificate on the Gateway's listener, which the platform team
+    # set once. A hostname the certificate does not cover produces a route that is accepted and a
+    # TLS handshake that fails, which reads like a DNS problem.
+    - research.agents.internal.example.com
+
+  rules:
+    # The MCP endpoint. Session affinity is handled upstream of this: either the egress gateway
+    # routes on the MCP session identifier, or the agent holds no session in the pod at all. A
+    # load balancer cannot do it, and neither can this route — see README.md.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mcp
+      backendRefs:
+        # The SERVICE's port (80 in service.yaml), not the container's. A backendRef names a port on
+        # the Service; naming the targetPort leaves the route with ResolvedRefs=False.
+        - name: research
+          port: 80
+
+      # WHAT ATTACHES THE GATE. Every rule that should be authenticated needs its own filter -- a
+      # rule without one is served unauthenticated, and nothing reports that. The gate is in
+      # listener-rule-jwt.yaml; the reference runs from here to it, not the other way round.
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.k8s.aws
+            kind: ListenerRuleConfiguration
+            name: research
+
+    # Everything else. Listed second because Gateway API matches the most specific rule rather than
+    # the first, so the order is for the reader rather than for the router.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        # The SERVICE's port (80 in service.yaml), not the container's. A backendRef names a port on
+        # the Service; naming the targetPort leaves the route with ResolvedRefs=False.
+        - name: research
+          port: 80
+
+      # WHAT ATTACHES THE GATE. Every rule that should be authenticated needs its own filter -- a
+      # rule without one is served unauthenticated, and nothing reports that. The gate is in
+      # listener-rule-jwt.yaml; the reference runs from here to it, not the other way round.
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.k8s.aws
+            kind: ListenerRuleConfiguration
+            name: research

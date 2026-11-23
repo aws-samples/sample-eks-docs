@@ -1,0 +1,24 @@
+# Pinned, not ranged, for the same reason as the reference agent: the dependency set is part of what
+# the image scan was evaluated against. See ../../VERSIONS.md.
+#
+# Python 3.10 or newer. The Dockerfile uses 3.13.
+
+# The evaluation harness. The [langfuse] extra brings the Langfuse SDK its LangfuseProvider reads
+# traces with; the CloudWatch provider and the AgentCore result writer need only boto3, which the
+# bare package already depends on.
+strands-agents-evals[langfuse]==1.9.0
+
+# Pinned explicitly as well as pulled by the extra, so the resolved version is recorded here. The
+# extra allows any 2.x or 3.x; the runner uses the 3.x client (create_score with session_id, and the
+# tracer_provider argument that keeps the runner's own spans out of Langfuse).
+langfuse==3.15.0
+
+# The judge is reached through the gateway's OpenAI-compatible endpoint, as every model call on this
+# stack is, so it needs Strands' OpenAI provider -- the [openai] extra, not the bare package, or
+# strands.models.openai is unimportable at startup.
+strands-agents[openai]==1.64.0
+openai==3.46.0
+
+# The runner calls deployed agents directly and reads its config file.
+httpx==0.28.1
+pyyaml==6.0.3

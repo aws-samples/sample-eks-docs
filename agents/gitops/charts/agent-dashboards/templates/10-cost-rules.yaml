@@ -1,0 +1,123 @@
+{{- if .Values.cost.enabled }}
+{{/*
+Recording rules for spend and tokens, built on the gateway's own figures.
+
+NO PRICE TABLE. The gateway prices every call against its own model cost catalogue and emits
+`agentgateway_gen_ai_client_cost_usd_total` in dollars, so nothing here has to be kept in step with
+a pricing page. There is no `cost.inputPerMillion` or `outputPerMillion` to set: a hand-maintained
+table blended across models is both unnecessary and less accurate, because the gateway's figures
+carry a model dimension.
+
+WHY THE RULES EXIST AT ALL, rather than putting these expressions in the panels. Two reasons, and
+the second is the real one:
+
+  1. `rate()` over a counter at 5m is wanted identically by several panels.
+  2. The per-agent dimension needs extracting. The gateway has NO agent label: the route carries it,
+     as "<namespace>/llm-<agent>" on the open source path, so every per-agent figure needs a
+     label_replace. Doing that once here means a panel cannot get it subtly wrong, and renaming the
+     route template means editing one pattern rather than every query.
+
+WHAT THESE SERIES ARE NOT. They are the near-real-time view, not the invoice. Authoritative
+per-agent cost is the Cost and Usage Report, keyed on the `agent` session tag the gateway sets when
+it assumes each agent's role.
+*/}}
+{{- $g := .Values.gateway }}
+{{- $gl := .Values.gateway.labels }}
+{{- $al := .Values.agentMetrics.labels }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: agent-cost-estimates
+  namespace: {{ .Values.collector.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    {{- with .Values.ruleSelectorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: agent-cost
+      interval: 30s
+      rules:
+{{- if $g.enabled }}
+        # --- dollars, from the gateway's resolved prices ----------------------
+        # Per model. The figure the gateway itself computed, with no arithmetic of ours on top.
+        - record: model:cost_usd:rate5m
+          expr: |
+            sum by ({{ $gl.requestModel }}) (rate({{ $g.metrics.cost }}[5m]))
+
+        # Per agent, extracted from the route. Dropping the model label here is deliberate: this is
+        # "what does this agent spend", and an agent that uses two models should appear once.
+        - record: agent:cost_usd:rate5m
+          expr: |
+            sum by (agent) (
+              label_replace(
+                rate({{ $g.metrics.cost }}[5m]),
+                "agent", "$1", "{{ $gl.route }}", "{{ $g.routePattern }}"
+              )
+            )
+
+        # Per agent AND per model, which is the one that answers "which model is this agent's
+        # spend going to".
+        - record: agent_model:cost_usd:rate5m
+          expr: |
+            sum by (agent, {{ $gl.requestModel }}) (
+              label_replace(
+                rate({{ $g.metrics.cost }}[5m]),
+                "agent", "$1", "{{ $gl.route }}", "{{ $g.routePattern }}"
+              )
+            )
+
+        # Dollars per hour, which is the unit the panels show. Kept as its own rule because the
+        # name is what the panels and any alert reference.
+        - record: agent:cost_usd_per_hour
+          expr: agent:cost_usd:rate5m * 3600
+
+        - record: model:cost_usd_per_hour
+          expr: model:cost_usd:rate5m * 3600
+
+        # --- tokens, from the gateway ----------------------------------------
+        # _sum on the histogram is the token count. Per agent and direction.
+        - record: agent:tokens:rate5m
+          expr: |
+            sum by (agent, {{ $gl.tokenType }}) (
+              label_replace(
+                rate({{ $g.metrics.tokens }}_sum[5m]),
+                "agent", "$1", "{{ $gl.route }}", "{{ $g.routePattern }}"
+              )
+            )
+
+        # Per model and direction, for the model-side panels.
+        - record: model:tokens:rate5m
+          expr: |
+            sum by ({{ $gl.requestModel }}, {{ $gl.tokenType }}) (
+              rate({{ $g.metrics.tokens }}_sum[5m])
+            )
+
+        # --- is the dollar figure real ----------------------------------------
+        # The share of priced calls the catalogue resolved exactly. Below 1 the spend panels are
+        # understating, and nothing else on the dashboard would show it.
+        - record: gateway:cost_catalog_exact:ratio5m
+          expr: |
+            sum(rate({{ $g.metrics.catalogLookups }}{status="Exact"}[5m]))
+              / clamp_min(sum(rate({{ $g.metrics.catalogLookups }}[5m])), 1e-9)
+{{- else }}
+        # gateway.enabled is false, so there is no in-cluster gateway to scrape and no cost series
+        # can be recorded. On the AWS services path that is the expected state: AgentCore Gateway is
+        # managed and exposes no metrics endpoint in the cluster. Use CloudWatch and the Cost and
+        # Usage Report. The token rules below still work, from the agent's own metrics, and carry no
+        # model dimension.
+        - record: agent:tokens:rate5m
+          labels:
+            {{ $gl.tokenType }}: input
+          expr: |
+            sum by ({{ $al.agent }}) (rate({{ .Values.agentMetrics.inputTokens }}_sum[5m]))
+
+        - record: agent:tokens:rate5m
+          labels:
+            {{ $gl.tokenType }}: output
+          expr: |
+            sum by ({{ $al.agent }}) (rate({{ .Values.agentMetrics.outputTokens }}_sum[5m]))
+{{- end }}
+{{- end }}

@@ -1,0 +1,33 @@
+{{- if .Values.networkPolicy.enabled }}
+# Turns on network policy enforcement for the cluster. Once, and before anything else here matters.
+#
+# Read this carefully, because it is the one object in this directory whose absence is silent. Until
+# this ConfigMap exists with the key set to "true", every NetworkPolicy, ApplicationNetworkPolicy
+# and ClusterNetworkPolicy on the cluster is accepted by the API server and not enforced. Objects
+# appear, `kubectl get` shows them, nothing drops a packet. The egress boundary the rest of this
+# stack rests on is simply not there.
+#
+# So the order is: this first, then the policies. And verify it rather than assume it:
+#
+#   kubectl -n kube-system get configmap amazon-vpc-cni \
+#     -o jsonpath='{.data.enable-network-policy-controller}'
+#
+#
+# GATED ON networkPolicy.enabled. With the layer off this ConfigMap is not rendered, so enforcement
+# is not turned on -- which is the point. Turning the layer off on a running cluster prunes this
+# ConfigMap, which switches the network policy controller off along with the policies. The
+# controller is what removes each policy's networking.k8s.aws finalizer, so bootstrap-gitops.sh
+# --prune releases that finalizer on the policies left deleting, and teardown.sh deletes the
+# policies while this object still exists.
+# https://docs.aws.amazon.com/eks/latest/userguide/auto-net-pol.html
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amazon-vpc-cni
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+data:
+  enable-network-policy-controller: "true"
+{{- end }}

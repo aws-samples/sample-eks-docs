@@ -1,0 +1,97 @@
+{{- if not (has "40-agent-sandbox.yaml" .Values.excluded) }}
+# Agent Sandbox: the lifecycle controller, from the Kubernetes SIG project of the same name.
+#
+# What it adds over an ordinary Deployment backed by a Nitro sandbox: warm pools of pre-booted
+# guests so a claim is adopted in about a second, suspend and resume, and scheduled deletion at an
+# expiry the controller enforces. Suspend deletes the agent's pod and its guest VM while the
+# workspace volume stays bound; resume boots a new guest on that same volume in a few seconds. So an
+# agent's files survive a suspend and its processes start fresh.
+#
+# When this earns its place: interactive or bursty agents that idle between turns, and agents that
+# are slow to initialize and would otherwise repeat that cost on every cold start. When it does not:
+# stateless request-and-response agents, which a standard Deployment serves more simply and which
+# the agent resource definition in gitops/base already produces.
+#
+# What it does not give: the processes and memory inside the sandbox. Suspend preserves the
+# workspace volume only; a resumed agent starts its processes fresh.
+#
+# This is self-managed. The controller is something the platform team installs and upgrades. Pin
+# the version and read the release notes: the extensions
+# (SandboxTemplate, SandboxWarmPool, SandboxClaim) are a separate API surface from the core Sandbox
+# and have moved faster.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agent-sandbox
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    # BEFORE the base chart (-10). The base chart's Agent resource definition composes a Sandbox by
+    # default (runtime: sandbox), and kro validates every composed kind when it accepts the graph:
+    # with these CRDs absent the whole Agent kind is rejected. The controller needs nothing from the
+    # base chart; its namespace is in the infrastructure carve-out.
+    argocd.argoproj.io/sync-wave: "-11"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://github.com/kubernetes-sigs/agent-sandbox.git
+
+    # Pinned. See VERSIONS.md.
+    targetRevision: v1.0.10
+    path: helm
+
+    helm:
+      valuesObject:
+        image:
+          tag: v1.0.10
+
+        # The namespace is NOT the chart's to create. The chart ships its own Namespace object
+        # (namespace.create, default true), and anything that creates the namespace first --
+        # `helm --create-namespace` in scripts/install-platform.sh -- makes Helm refuse the whole
+        # release: `namespaces "agent-sandbox-system" already exists`, so the controller never
+        # installs. CreateNamespace=true below creates it
+        # under Argo CD, and the script creates it otherwise, so one owner on both.
+        namespace:
+          create: false
+
+        controller:
+          # The extensions: SandboxTemplate, SandboxWarmPool and SandboxClaim, on top of the core
+          # Sandbox CRD. The warm-pool example in gitops/examples/warm-pool uses all three, so this
+          # is on.
+          extensions: true
+
+  destination:
+    name: eks-agents
+    namespace: agent-sandbox-system
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, several Applications
+    # can each spend minutes retrying with backoff that grows to minutes, and a chart that syncs
+    # in seconds waits behind them. Capped at 30 s, a transient failure costs seconds; the
+    # higher limit keeps the total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      # prune: false. This chart carries the Sandbox CRDs, and pruning a CRD deletes every Sandbox
+      # on the cluster — which on this controller means deleting the workspace volumes behind them,
+      # because a PVC created from volumeClaimTemplates carries the Sandbox as its ownerReference.
+      # Suspend preserves a workspace; delete never does.
+      prune: false
+      selfHeal: true
+
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      - Replace=true
+{{- end }}

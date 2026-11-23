@@ -1,0 +1,16 @@
+{{- if .Values.ingress.enabled }}
+{{- /*
+The gateway.k8s.aws CRDs, IN THIS APPLICATION, at sync wave -2: before the GatewayClass and
+LoadBalancerConfiguration (-1), the Gateway (0) and the agent resource definition, whose graph
+composes ListenerRuleConfigurations and TargetGroupConfigurations. Argo CD applies them and waits
+for them to be established before the next wave, in the same operation, so neither the first sync
+nor the one that turns ingress on can reach an object of these kinds before its CRD exists.
+
+In this chart rather than a sibling Application, so nothing races them: see
+scripts/vendor-aws-gateway-crds.sh, which generates the file and explains the annotations each CRD
+carries. EKS Auto Mode installs these only with
+`elasticLoadBalancing.gatewayApi.crds.managed: true`, and this repository runs unmanaged because
+it owns the standard Gateway API CRDs itself (10-gateway-api-crds.yaml).
+*/}}
+{{ .Files.Get "files/aws-gateway-api-crds.yaml" }}
+{{- end }}

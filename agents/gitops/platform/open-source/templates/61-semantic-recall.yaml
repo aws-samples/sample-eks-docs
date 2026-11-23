@@ -1,0 +1,203 @@
+{{- if not (has "61-semantic-recall.yaml" .Values.excluded) }}
+# Memory rung 2 on the open source path: semantic recall, which is retrieval by meaning.
+#
+# Off by default: the platform chart's excluded list leaves this file out unless
+# enable_semantic_recall is on (terraform/open-source/main.tf, platform_excluded).
+#
+# An agent that answers questions over a corpus usually stops at this rung, because what it needs is
+# retrieval and not memory. An agent whose state lives and dies with one task needs neither this nor
+# the rung above.
+#
+# WHY A POSTGRES OPERATOR AND NOT A BARE POSTGRES CHART.
+#
+# pgvector's whole argument is that it adds an index to a database you already operate rather than a
+# new stateful tier. If a team already runs Postgres, the right move is `CREATE EXTENSION vector` in
+# that database and nothing in this file. These Applications exist for the team that does not, and
+# for them a single-pod Postgres chart holding the agents' retrieval corpus is the wrong answer:
+# backup, failover and major-version upgrade are the parts that make a database a tier, and an
+# operator is what carries them.
+#
+# So: the CloudNativePG operator, and a Cluster with the vector extension enabled. That is three
+# replicas and a controller that handles failover, with WAL archiving to S3 available once backup is
+# configured (off below), which is a real commitment. Read it before enabling it, and prefer S3 Vectors from terraform/modules/memory-aws if
+# the team would rather not run a database at all. Mixing paths is expected.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cloudnative-pg
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/memory-rung: semantic-recall
+    eks-agents/enabled: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-options: Prune=false
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://cloudnative-pg.github.io/charts
+    chart: cloudnative-pg
+    # Pinned. See VERSIONS.md.
+    targetRevision: 0.29.1
+
+    helm:
+      valuesObject:
+        # The operator is a controller, not an agent. It is not sandboxed and does not need to be:
+        # the sandbox protects the node from untrusted code, and this runs none.
+        resources:
+          requests:
+            cpu: 100m
+            memory: 200Mi
+          limits:
+            cpu: "1"
+            memory: 500Mi
+
+  destination:
+    name: eks-agents
+    namespace: cnpg-system
+
+  # TURNED ON BY enable_semantic_recall, which is what renders this file at all: the platform
+  # chart's excluded list leaves it out otherwise, so a cluster without the rung carries neither
+  # Application.
+  #
+  # prune: false for the same reason as every other CRD-bearing chart here:
+  # pruning a CRD deletes every Cluster defined against it, and with it the databases.
+  # NOT Replace=true. A replace rewrites every object whole, including the operator's webhook
+  # configurations, so the caBundle the operator patches in is wiped on each sync and every Cluster
+  # write then fails with `x509: certificate signed by unknown authority` -- agent-semantic-recall's
+  # sync reads Failed with the database already healthy.
+  # ServerSideApply alone keeps the CRD from tripping the annotation size limit, and the chart does
+  # not render caBundle, so the operator's field is left alone.
+  syncPolicy:
+    automated: { prune: false, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+---
+# The Postgres cluster that holds the vector index.
+#
+# Separate Application from the operator, so the database's configuration — which a platform team
+# iterates on — is separable from the operator's version, which it does not.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agent-semantic-recall
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/memory-rung: semantic-recall
+    eks-agents/enabled: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+    argocd.argoproj.io/sync-options: Prune=false
+    # SERVER-SIDE DIFF, because CNPG's mutating webhook defaults a dozen Cluster fields the chart
+    # does not render, and a client-side diff reads them as drift: the Cluster stays OutOfSync
+    # after every successful sync. The base chart does the same.
+    argocd.argoproj.io/compare-options: ServerSideDiff=true
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://cloudnative-pg.github.io/charts
+    chart: cluster
+    targetRevision: 0.9.0
+
+    helm:
+      valuesObject:
+        type: postgresql
+
+        cluster:
+          instances: 3
+
+          # The image has to carry the vector extension. The operator's default Postgres image does
+          # not, and `CREATE EXTENSION vector` then fails with "extension is not available", which
+          # reads like a permissions problem rather than a missing shared library.
+          imageName: ghcr.io/cloudnative-pg/postgresql:17.6-standard-bookworm
+
+          storage:
+            size: 50Gi
+            # Uses the default StorageClass the base chart creates. Without it every claim here
+            # stays Pending; see gitops/base/templates/15-storage-class.yaml.
+
+          postgresql:
+            shared_preload_libraries: []
+
+          # Create the extension at bootstrap rather than leaving it to whoever first connects. An
+          # agent's retrieval code should not need CREATE privileges, and it would need them to add
+          # the extension itself.
+          initdb:
+            database: agentmemory
+            owner: agent
+            postInitTemplateSQL:
+              - CREATE EXTENSION IF NOT EXISTS vector;
+          # THE LOGIN AGENTS USE, separate from the owner CloudNativePG generates. A managed role is
+          # reconciled at any time, not only at bootstrap, so it can be added to a running cluster.
+          # Its password is the platform-secrets Secret `agent-memory-db` (Terraform generates it
+          # into Secrets Manager; the syncer projects it here), and an agent reads the same value
+          # from Secrets Manager on its own role. Membership in the owner role is what lets it create
+          # its tables in `public`, which PostgreSQL 15+ reserves to the database owner.
+          #
+          # ONE LOGIN FOR EVERY AGENT. Separation between agents is the table each one writes (the
+          # reference agent's collection is mem0_<agent>) and Mem0's agent and user filters, not a
+          # database permission: an agent holding this login can read another agent's table. A role
+          # per agent is the hardening, and it needs a password per agent that something other than
+          # kro generates.
+          roles:
+            - name: agent_memory
+              ensure: present
+              login: true
+              inherit: true
+              inRoles:
+                - agent
+              passwordSecret:
+                name: agent-memory-db
+
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+
+          monitoring:
+            # Exposes Postgres metrics to the Prometheus the observability Application runs, so the
+            # tier a team just took on is visible rather than opaque.
+            enablePodMonitor: true
+
+        # Backup is off here and should not stay off. The chart writes WAL and base backups to an
+        # object store, which needs a bucket and a Pod Identity association this file cannot create
+        # — so turning it on is a Terraform change plus a values change, and the honest default is
+        # to show the absence rather than imply a backup exists.
+        backups:
+          enabled: false
+
+  destination:
+    name: eks-agents
+    namespace: agent-memory
+
+  # Synced with the operator above when enable_semantic_recall is on. CreateNamespace because nothing
+  # in the base creates agent-memory (session state is opt-in).
+  syncPolicy:
+    automated: { prune: false, selfHeal: true }
+    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+{{- end }}

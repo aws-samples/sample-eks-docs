@@ -1,0 +1,16 @@
+apiVersion: v2
+name: agentgateway-config
+description: >-
+  The AgentGateway configuration for the open source path: the GatewayClass and Gateway that
+  form the egress point, the backends for Bedrock and for each third-party destination, the routes,
+  and the policies that decide which caller gets which backend on what budget.
+
+  Separate from the chart that installs AgentGateway. The install is a version bump; this is the
+  organization's egress policy, and it changes on a different cadence and gets a different review.
+type: application
+
+version: 0.1.0
+appVersion: "0.1.0"
+
+annotations:
+  eks-agents/paved-path: open-source

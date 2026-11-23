@@ -1,0 +1,37 @@
+{{- /*
+THE OCI HELM REGISTRIES, REGISTERED WITH ARGO CD BY THE COMPONENT THAT NEEDS ONE.
+
+Argo CD resolves a `repoURL` with no scheme as an OCI registry only when a repository of type helm
+with enableOCI is registered for it; without one the Application fails to fetch its chart, and the
+error names the chart rather than the missing registration.
+
+Each is rendered with the component that pulls from it, so turning the gateway on brings its
+registry in the same sync, with no bootstrap object to re-apply, and a cluster registers only the
+registries it uses. The base Application syncs at wave -10, ahead of every Application that needs one.
+
+All three are public: no credentials, so nothing here is secret despite the kind. A private mirror
+is the same object with username/password, or an ECR pull role, added.
+*/}}
+{{- $repos := dict
+  "agentgateway"  (list "agentgateway"  "cr.agentgateway.dev/charts")
+  "clickhouse"    (list "clickhouse"    "ghcr.io/clickhouse")
+  "bitnamicharts" (list "bitnamicharts" "registry-1.docker.io/bitnamicharts") }}
+{{- range $key, $repo := $repos }}
+{{- if index ($.Values.ociRepositories | default dict) $key }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: oci-{{ $key }}
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+stringData:
+  type: helm
+  name: {{ index $repo 0 }}
+  url: {{ index $repo 1 }}
+  enableOCI: "true"
+{{- end }}
+{{- end }}

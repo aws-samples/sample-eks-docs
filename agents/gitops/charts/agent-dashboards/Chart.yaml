@@ -1,0 +1,21 @@
+apiVersion: v2
+name: agent-dashboards
+description: >-
+  The out-of-box agent dashboard for the open source path: a Grafana dashboard over the OpenTelemetry
+  GenAI semantic conventions, the ServiceMonitor and PodMonitor that get those metrics into
+  Prometheus, and the recording rules over the gateway's own spend and token figures.
+
+  This is the piece a team on the open source path otherwise builds itself. The managed path reads
+  per-invocation token counts and tool-call outcomes from curated views; there is no open source
+  equivalent, so the equivalent here is this chart.
+
+  Read the spend notes in values.yaml before showing the spend panels to anyone who makes budget
+  decisions: the figures are the gateway's resolved prices, not billed cost, and the Cost and Usage
+  Report is authoritative.
+type: application
+
+version: 0.1.0
+appVersion: "0.1.0"
+
+annotations:
+  eks-agents/paved-path: open-source

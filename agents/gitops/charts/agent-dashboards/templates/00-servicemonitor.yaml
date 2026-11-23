@@ -1,0 +1,38 @@
+{{/*
+Get the GenAI metrics into Prometheus.
+
+Without this the collector exports them on :8889 and nothing scrapes it, so every panel in the
+dashboard is empty while the collector, Prometheus and Grafana all report healthy. That is the
+failure mode this file exists to prevent, and it is worth stating because it looks like a dashboard
+bug rather than a missing scrape target.
+
+Two halves are needed and only one of them is here. The Service has to publish the port as well,
+which the `ports.metrics` block on the collector's Application in
+gitops/platform/open-source/templates/50-observability.yaml does. Confirm both landed:
+
+  kubectl -n monitoring get servicemonitor agent-genai -o yaml
+  kubectl -n monitoring exec -it prometheus-kube-prometheus-stack-prometheus-0 -c prometheus -- \
+    wget -qO- localhost:9090/api/v1/targets | grep -c agent-genai
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: agent-genai
+  namespace: {{ .Values.dashboard.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.collector.namespace }}
+  selector:
+    matchLabels:
+      {{- toYaml .Values.collector.serviceSelector | nindent 6 }}
+  endpoints:
+    - port: {{ .Values.collector.portName }}
+      interval: {{ .Values.collector.interval }}
+      # The collector's own metric names are already namespaced, so no relabelling is needed. What
+      # does matter is keeping the labels the exporter produced: honorLabels stops Prometheus from
+      # overwriting the agent and model labels with the scrape target's own.
+      honorLabels: true

@@ -1,0 +1,63 @@
+{{- if not (has "62-consolidation.yaml" .Values.excluded) }}
+# Memory rung 3 on the open source path, as a SERVER: an alternative, not the sample's default.
+#
+# INERT WHERE IT SITS. It is not under templates/, so the platform chart never renders it.
+# The sample's default for rung 3 is Mem0 as a library inside the agent (enable_consolidation, and the
+# agents-memory page of the EKS User Guide), which needs no image and makes its model calls on the
+# agent's own identity through the gateway. Move this file into templates/ only for a shared Mem0
+# server that several non-Strands clients call, and build its image first, as below.
+#
+#
+# DISABLED BY DEFAULT, and more firmly than the rungs below it. The chart itself refuses to render
+# until an image built from source is named, so a sync of this Application fails loudly rather than
+# pulling the unpinnable published image.
+#
+# Read gitops/charts/mem0/values.yaml before enabling. The short version: the published image has
+# only a `latest` tag, so build from source into ECR, or use `mem0ai` as a library inside the agent
+# and do not deploy this at all — for the rung most teams never reach, the library is the right
+# weight.
+#
+# This rung depends on rung 2: Mem0 keeps consolidated memories in a vector store and its metadata
+# in Postgres, both of which 61-semantic-recall.yaml creates.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agent-consolidation
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/memory-rung: consolidation
+    eks-agents/enabled: "false"
+  annotations:
+    # After the Postgres it depends on.
+    argocd.argoproj.io/sync-wave: "4"
+    argocd.argoproj.io/sync-options: Prune=false
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: {{ .Values.repo.url }}
+    targetRevision: {{ .Values.repo.revision }}
+    path: {{ .Values.repo.path }}gitops/charts/mem0
+
+    helm:
+      valueFiles:
+        - values.yaml
+      # ignoreMissingValueFiles stays at its default, false, so a missing values file fails the
+      # render. Not written out: the EKS Argo CD capability rewrites Application objects and drops
+      # a false field, so the root Application would compare Git's false with nothing and stay
+      # OutOfSync.
+      # The rendered values (terraform), passed by the root Application.
+      values: |
+        {{- toYaml .Values.terraform | nindent 8 }}
+  destination:
+    name: eks-agents
+    namespace: agent-memory
+
+  # No syncPolicy, which is the gate. The Application exists, shows its diff, and applies nothing
+  # until a human syncs it — and the chart's own fail guards mean that sync does not succeed until
+  # the image and the gateway URL are set deliberately.
+{{- end }}

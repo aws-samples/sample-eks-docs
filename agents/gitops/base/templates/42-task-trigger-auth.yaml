@@ -1,0 +1,20 @@
+{{- if (.Values.tasks | default dict).enabled }}
+{{/*
+How KEDA reads a task agent's queue depth: with its OWN identity (identityOwner: keda), the KEDA
+operator's EKS Pod Identity association, whose role may call sqs:GetQueueAttributes on the agents'
+task queues and nothing else (terraform/modules/agent-tasks). Not the agent's role: the agent's
+pod does not exist until KEDA has read the queue, and an operator that could assume every agent's
+role would hold every agent's permissions.
+*/}}
+apiVersion: keda.sh/v1alpha1
+kind: ClusterTriggerAuthentication
+metadata:
+  name: {{ .Values.tasks.triggerAuthentication | default "eks-agents-sqs" }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  podIdentity:
+    provider: aws
+    identityOwner: keda
+{{- end }}

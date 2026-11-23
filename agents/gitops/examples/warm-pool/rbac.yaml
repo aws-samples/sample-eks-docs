@@ -1,0 +1,92 @@
+# The RBAC for a reasoning tier that drives a warm pool.
+#
+# This is the exception to "agents do not hold a Kubernetes API token". Claiming a sandbox is a
+# Kubernetes API call, so a reasoning tier that drives the pool needs one — and because that pod's
+# next model response decides what it does, the scope of that token is the whole control.
+#
+# Read what is and is not here. Create, get, list, watch and delete on sandboxclaims; read on pods,
+# their logs and sandboxes; exec and attach on pods. Nothing on secrets, nothing that creates or
+# changes a pod, nothing on sandboxtemplates or sandboxwarmpools — an agent that could edit the
+# template could drop the network-isolated annotation and get a pod with a working interface, which
+# is the escalation this Role exists to prevent.
+#
+# A Role and RoleBinding, not cluster-scoped. The binding is in agents-execution and the subject is
+# the service account in agents, which is how a reasoning tier in one namespace drives a pool in
+# another without holding rights in its own.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: warm-pool-driver
+  namespace: agents-execution
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+rules:
+  # The claim lifecycle. This is what the reasoning tier's sandbox tool calls.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+
+  # Reading the claim's status is how the tier learns which pod it got.
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims/status"]
+    verbs: ["get"]
+
+  # Finding and reading the claimed pod. get and list, not create or delete: the controller creates
+  # the pods, and a tier that could create a pod directly could create one without the sandbox
+  # runtime class — which admission would refuse, but there is no reason to let it try.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+
+  # Running the command, and staging files in and results out. This is the channel that works
+  # without a network device, and it is the whole of how the two tiers communicate.
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/attach"]
+    verbs: ["create", "get"]
+
+  # Reading the sandbox a claim adopted. get, not patch -- see the note below.
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list"]
+
+  # SUSPENDING A SESSION IS NOT HERE, deliberately, and this is the one verb to think about before
+  # adding.
+  #
+  # `operatingMode: Suspended` lives on the core Sandbox, not on the SandboxClaim -- the claim's
+  # lifecycle block carries only shutdownPolicy, shutdownTime and ttlSecondsAfterFinished. So a
+  # reasoning tier that suspends its own idle sessions needs `patch` on `sandboxes`:
+  #
+  #   - apiGroups: ["agents.x-k8s.io"]
+  #     resources: ["sandboxes"]
+  #     verbs: ["patch"]
+  #
+  # What that grants is wider than "suspend". `patch` on a Sandbox is patch on its whole spec,
+  # including its podTemplate -- so an agent holding it could in principle rewrite the pod it runs
+  # in, and the network-isolated annotation with it. There is no narrower verb: Kubernetes RBAC has
+  # no field-level grant, and the Sandbox CRD exposes no suspend subresource.
+  #
+  # So: leave it off unless the tier really drives suspend, and if it does, prefer having the
+  # PLATFORM suspend on a TTL -- lifecycle.ttlSecondsAfterFinished on the claim already bounds an
+  # abandoned session without granting anything.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: warm-pool-driver
+  namespace: agents-execution
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: warm-pool-driver
+subjects:
+  # The reasoning tier's service account, in its own namespace. Name the agent that drives the pool;
+  # do not bind a group or every service account in the namespace, or every agent on the cluster
+  # gains exec into the tier that runs untrusted code.
+  - kind: ServiceAccount
+    name: research
+    namespace: agents

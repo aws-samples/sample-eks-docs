@@ -1,0 +1,511 @@
+{{- if not (has "51-langfuse.yaml" .Values.excluded) }}
+# Langfuse: traces, prompt management and the store the evaluation harness writes grades to, on the
+# open source path.
+#
+# SYNCED ONLY WITH enable_langfuse = true. The platform chart's excluded list leaves this file out
+# otherwise -- the same switch that turns on the collector's export to Langfuse
+# (collector-values.yaml) -- so the two cannot disagree. A Langfuse with no exporter feeding it loads,
+# shows empty pages and reports nothing.
+#
+# THREE APPLICATIONS IN THIS FILE, ordered by sync wave. From chart v2.0.0 the bundled ClickHouse is
+# not a StatefulSet in a subchart: the chart renders `ClickHouseCluster` and `KeeperCluster` custom
+# resources that an operator reconciles, and it preflights both CRD sets at render time. So the
+# cluster needs, before Langfuse:
+#
+#   wave 1  cert-manager          the ClickHouse operator issues its webhook certificates through it
+#   wave 2  clickhouse-operator   the ClickHouseCluster / KeeperCluster CRDs and their controller
+#   wave 3  langfuse
+#
+# A wave orders the START of each sync, not its completion, so Langfuse can be created before the
+# operator's CRDs exist. The chart's own CRD preflight is therefore off (`clickhouse.crdCheck:
+# false`): with it on, that race failed the render, which Argo CD does not retry. With it off, the
+# race fails the sync, and the retry policy repeats it until the CRDs are registered.
+#
+# cert-manager is not optional and not for Langfuse's own TLS — the ClickHouse operator issues its
+# admission webhook certificates through it.
+#
+# The ClickHouse operator's chart is published only as OCI (ghcr.io/clickhouse). Argo CD reads it
+# through the repository the base chart registers while enable_langfuse is on
+# (gitops/base/templates/05-oci-repositories.yaml).
+#
+# What a team is taking on. Langfuse stores its traces in ClickHouse. So adopting it means also
+# operating:
+#
+#   - an analytical database, through the ClickHouse Kubernetes operator (API group
+#     `clickhouse.com/v1alpha1`) — which is itself a component to run and upgrade
+#   - cert-manager, cluster-wide, because that operator depends on it
+#   - a ClickHouse Keeper quorum — a separate `KeeperCluster`, and it cannot be switched off while
+#     `clickhouse.deploy` is true, because the ClickHouseCluster CRD requires a `keeperClusterRef`
+#     even for a single replica
+#   - the object storage behind them
+#   - Postgres, for Langfuse's own metadata
+#   - Valkey, for its queues
+#
+# That is the real difference between the two paths at this layer. The managed option leaves the
+# platform team no state to run. This option's heaviest stateful component is ClickHouse, and a team
+# that reads "Langfuse" as one more Helm chart will discover that tier in production.
+#
+# The chart's bundled subcharts will stand all of it up, which is the right choice for an evaluation
+# and the wrong one for production: the bundled ClickHouse is one replica with a single-node Keeper
+# behind it, and it holds the trace history a team adopted Langfuse for. Note what the bundled tiers
+# actually are, since the names differ from Langfuse's own prose — Postgres from
+# `groundhog2k/helm-charts`, **Valkey** rather than Redis, and **SeaweedFS** rather than MinIO for
+# the object store. Point the chart at a tier the team operates ahead of this carrying anything
+# it would miss.
+#
+# What it buys, to set against that: traces with the agent's trajectory, prompt management with
+# versioning, and one place to read evaluation grades beside the traces they grade. The grading
+# itself is gitops/charts/agent-evals (Strands Evals), which reads sessions from here and writes
+# scores back -- not Langfuse's own evaluators, which call the judge from inside Langfuse over a
+# static key this stack's gateway refuses. For a team that wants its agent telemetry, its prompts and
+# its evaluation results in one self-hosted system, that is a real consolidation.
+#
+# KEYS. Langfuse creates its first organization, project and user at startup from the
+# langfuse-init Secret (LANGFUSE_INIT_* below), with project API keys that
+# terraform/modules/platform-secrets generated -- the same keys the collector exports with and the
+# evaluation runner reads with. No key is clicked into the UI and copied anywhere.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cert-manager
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+  source:
+    # The same pin as the aws-services path's cert-manager (45-cert-manager.yaml).
+    repoURL: https://charts.jetstack.io
+    chart: cert-manager
+    targetRevision: v1.19.1
+    helm:
+      valuesObject:
+        crds:
+          enabled: true
+          # Keep the CRDs when the release goes: deleting them deletes every Certificate with them.
+          keep: true
+  destination:
+    name: eks-agents
+    namespace: cert-manager
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: clickhouse-operator
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+  source:
+    # OCI only; no http index exists. See gitops/base/templates/05-oci-repositories.yaml.
+    repoURL: ghcr.io/clickhouse
+    chart: clickhouse-operator-helm
+    targetRevision: 0.0.8
+  destination:
+    name: eks-agents
+    namespace: clickhouse-operator-system
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      # CRDs: pruning one deletes every ClickHouseCluster defined against it, which is Langfuse's
+      # trace store.
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: langfuse
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+    # NO GENERATED CREDENTIAL IS LEFT IN THIS RENDER. Each data tier reads a *-platform Secret
+    # Terraform generates (existingSecret below), and langfuse-app is empty because salt, encryption
+    # key and NextAuth secret come from langfuse-secrets. The chart's own generated passwords are
+    # rewritten on every Argo CD render, since it keeps them with Helm `lookup` (the chart's
+    # langfuse-app-secret.yaml documents the same caveat). The one varying
+    # object left is langfuse-s3-sftp-secret, which SeaweedFS renders with SFTP off and never mounts.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://langfuse.github.io/langfuse-k8s
+    chart: langfuse
+
+    # Pinned. See VERSIONS.md.
+    targetRevision: 2.2.3
+
+    helm:
+      valuesObject:
+        langfuse:
+          # Internal only. Langfuse holds every prompt and completion the agents produced, which is
+          # the most sensitive content on the platform.
+          ingress:
+            enabled: false
+
+          # None of these are set here, deliberately. Every one is a secret, and a secret in a Helm
+          # values file is a secret in Git. Create them out of band and reference them:
+          #
+          #   salt.secretKeyRef, nextauth.secret.secretKeyRef, encryptionKey.secretKeyRef
+          #
+          # The encryption key is the one to get right: it encrypts the API keys Langfuse holds for
+          # the model providers it calls during evals, and losing it loses them.
+          salt:
+            secretKeyRef:
+              name: langfuse-secrets
+              key: salt
+          nextauth:
+            secret:
+              secretKeyRef:
+                name: langfuse-secrets
+                key: nextauth-secret
+          encryptionKey:
+            secretKeyRef:
+              name: langfuse-secrets
+              key: encryption-key
+
+          # HEADLESS INITIALIZATION: Langfuse creates its first organization, project and user at
+          # startup from these, and does nothing if they already exist. The project's API keys are
+          # the ones the collector exports traces with (langfuse-otlp, in monitoring) and the
+          # evaluation runner reads sessions and writes scores with (langfuse-evals-api, in
+          # agent-evals) -- all three generated together by terraform/modules/platform-secrets, so
+          # they cannot disagree. Sign in to the UI as the user below with the generated password,
+          # read from Secrets Manager (<cluster>/platform/langfuse-init).
+          #
+          # NO LLM CONNECTION, and so no SSRF allowlist. Langfuse never calls a model on this
+          # stack: grading is done by gitops/charts/agent-evals, which reaches the judge through the
+          # gateway on its own projected token. Langfuse's own evaluators could not: an LLM
+          # connection holds one static key, and the gateway accepts only a short-lived token.
+          additionalEnv:
+            - name: LANGFUSE_INIT_ORG_ID
+              value: eks-agents
+            - name: LANGFUSE_INIT_ORG_NAME
+              value: EKS agents
+            - name: LANGFUSE_INIT_PROJECT_ID
+              value: agents
+            - name: LANGFUSE_INIT_PROJECT_NAME
+              value: agents
+            - name: LANGFUSE_INIT_PROJECT_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef: { name: langfuse-init, key: public-key }
+            - name: LANGFUSE_INIT_PROJECT_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: langfuse-init, key: secret-key }
+            - name: LANGFUSE_INIT_USER_EMAIL
+              value: admin@eks-agents.local
+            - name: LANGFUSE_INIT_USER_NAME
+              value: admin
+            - name: LANGFUSE_INIT_USER_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: langfuse-init, key: password }
+
+          # REQUESTS, BECAUSE THE CHART SHIPS NONE. `langfuse.resources`, `langfuse.web.resources`,
+          # `langfuse.worker.resources`, `postgresql.resources` and `redis.resources` are all `{}`
+          # upstream, so every one of these pods is schedulable anywhere and invisible to the
+          # scheduler's accounting. The chart sets non-empty defaults for ClickHouse alone, and its
+          # own comment says why -- "avoid the operator's ~1Gi fallback that OOMs under load" -- but
+          # the Langfuse pods did not get the same treatment.
+          #
+          # With no requests, langfuse-web can be packed onto a node already running Prometheus and
+          # cert-manager until the node runs out of memory and goes NotReady with "Kubelet stopped
+          # posting node status". Nothing in that failure names memory, and `kubectl logs` fails
+          # with a kubelet TLS handshake timeout rather than anything about the pod -- so this
+          # presents as a broken node, not as an unsized workload.
+          #
+          # Numbers are a floor for an evaluation, not a sizing exercise. Measure before production.
+          web:
+            resources:
+              requests: { cpu: 500m, memory: 2Gi }
+              limits: { memory: 3Gi }
+
+            # THE CHART'S PDB DEADLOCKS AUTO MODE NODE REPAIR, so it is off here.
+            #
+            # Out of the box the chart ships `langfuse.replicas: 1` and `web.pdb.create: true` --
+            # a PodDisruptionBudget over a single replica, defaulting to `maxUnavailable: 1`. When
+            # that one pod is unhealthy, `currentHealthy` is 0 and the budget reports
+            # `disruptionsAllowed: 0`. The pod that needs to move is the pod the budget pins, and
+            # the only thing that would make it healthy is moving it:
+            #
+            #   node     i-...  NotReady, "Kubelet stopped posting node status"
+            #   karpenter       DisruptionBlocked: Pdb prevents pod evictions
+            #                   (PodDisruptionBudget=[langfuse/langfuse-web-pdb])
+            #
+            # So the node is never repaired or replaced, and nothing in the symptom points at a
+            # PDB. The correct remedy is `spec.unhealthyPodEvictionPolicy: AlwaysAllow`, which
+            # exists for exactly this and is GA from Kubernetes 1.31 -- patching it onto the live
+            # object takes `disruptionsAllowed` from 0 to 1 immediately. The chart exposes only
+            # `create`, `minAvailable` and `maxUnavailable`, so it CANNOT express that field.
+            #
+            # Given that, a chart-generated PDB is a liability rather than a protection. If a
+            # platform team wants one, own it: set `create: false` as below and apply a PDB that
+            # carries the policy.
+            #
+            #   spec:
+            #     maxUnavailable: 1
+            #     unhealthyPodEvictionPolicy: AlwaysAllow
+            #     selector:
+            #       matchLabels:
+            #         app.kubernetes.io/name: langfuse
+            #         app.kubernetes.io/instance: langfuse
+            #         app.kubernetes.io/component: web
+            pdb:
+              create: false
+
+          worker:
+            resources:
+              requests: { cpu: 250m, memory: 1Gi }
+              limits: { memory: 2Gi }
+            # Same reasoning as web. A worker that stays healthy leaves its budget allowing a
+            # disruption -- that is luck, not a different shape.
+            pdb:
+              create: false
+
+        # STORAGE, AND WHERE THE CHART'S DEFAULTS PUT IT. The chart's defaults provision **103 GiB**
+        # across five tiers before a single trace is ingested, because a PVC is allocated at its
+        # requested size on creation and EBS bills the request, not the usage. With no traffic yet,
+        # each tier uses a small fraction of its request, so the cost is entirely the request. The sizes below are a floor for an evaluation and total
+        # about 24 GiB. **A PVC can be expanded and never shrunk**, so a team that takes the
+        # defaults and later wants them smaller has to recreate the volumes; pick deliberately the
+        # first time.
+        #
+        # For production, size from the observed ingest rate rather than from these: the floor below
+        # would be wrong by orders of magnitude for a fleet of agents.
+        clickhouse:
+          # Smallest cluster the chart will render: one server replica and a one-node Keeper. Fine
+          # for an evaluation and wrong for production, where the server wants 3+ replicas and
+          # Keeper an odd quorum of 3 or 5.
+          #
+          # These are `cluster.replicas` and `keeper.replicas`, NOT `shards` and `replicaCount`.
+          # Those two are not chart values at all -- `shards: 1` is hardcoded in
+          # the chart's own ClickHouseCluster template, and Helm accepts unknown values in silence,
+          # so a file that sets them looks like it sizes the tier and sizes nothing. If you set a
+          # value here, confirm it against `helm show values langfuse/langfuse --version <pin>`.
+          deploy: true
+          # THE CHART'S CRD PREFLIGHT IS OFF. It calls Helm `fail` when the operator's CRDs are not
+          # registered yet, and a failed RENDER is not covered by the retry policy below: Argo CD
+          # keeps it until a hard refresh, so an Application created before the operator's CRDs
+          # sits at sync status Unknown for minutes. The operator is in this file, two waves
+          # earlier, so the check guards nothing here. Without it, a CRD that has not arrived fails
+          # the SYNC instead, which the retry policy repeats until the operator has registered it.
+          crdCheck: false
+          # Credentials from gitops/charts/platform-secrets, which Terraform generates once: the
+          # chart's own are regenerated on every Argo CD render (it keeps them with Helm `lookup`).
+          auth:
+            existingSecret: langfuse-clickhouse-platform
+            existingSecretKey: password
+          cluster:
+            replicas: 1
+            # Default 100Gi. This is the trace store, so it is the one to grow first.
+            storage:
+              size: 10Gi
+          keeper:
+            # Must be odd: 1, 3 or 5.
+            replicas: 1
+            # Default 20Gi. Keeper holds a Raft log, not data.
+            storage:
+              size: 2Gi
+
+        postgresql:
+          deploy: true
+          # Credentials from gitops/charts/platform-secrets, which Terraform generates once: the
+          # chart's own are regenerated on every Argo CD render (it keeps them with Helm `lookup`).
+          auth:
+            existingSecret: langfuse-postgresql-platform
+            secretKeys:
+              userPasswordKey: USERDB_PASSWORD
+              adminPasswordKey: POSTGRES_PASSWORD
+          settings:
+            existingSecret: langfuse-postgresql-platform
+          userDatabase:
+            existingSecret: langfuse-postgresql-platform
+          # Default 20Gi, for Langfuse's own metadata -- projects, users, prompts, evaluator and
+          # rule definitions. It does not hold traces, so it does not grow with ingest.
+          #
+          # Note `persistentVolumeClaimRetentionPolicy.whenDeleted: Retain` upstream: uninstalling
+          # the release leaves this PVC behind, which is the right default for the tier that holds
+          # your prompts, and a surprise if you expected `helm uninstall` to be the end of it.
+          storage:
+            requestedSize: 5Gi
+          # Also `{}` upstream. See the note on the web and worker requests above.
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { memory: 1Gi }
+
+        redis:
+          # The key is `redis`; the subchart behind it is Valkey.
+          deploy: true
+          # Credentials from gitops/charts/platform-secrets, which Terraform generates once: the
+          # chart's own are regenerated on every Argo CD render (it keeps them with Helm `lookup`).
+          auth:
+            existingSecret: langfuse-redis-platform
+            existingSecretPasswordKey: default
+            usersExistingSecret: langfuse-redis-platform
+          # RECREATE, because the cache's volume is ReadWriteOnce. With the sub-chart's default
+          # RollingUpdate a restart deadlocks: the new pod, on another node, waits on
+          # `FailedAttachVolume ... already used by pod` while the old one holds the disk. The S3
+          # tier's chart already defaults to Recreate.
+          deploymentStrategy: Recreate
+          # Default 8Gi for what is a queue.
+          dataStorage:
+            requestedSize: 2Gi
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+
+        s3:
+          # The chart's bundled SeaweedFS, in allInOne mode -- not MinIO. For production use an S3
+          # bucket instead: the trace payloads land here, and a bucket is the one component on this
+          # list that AWS already operates.
+          deploy: true
+
+          # Credentials from gitops/charts/platform-secrets, which Terraform generates once: the
+          # chart's own are regenerated on every Argo CD render (it keeps them with Helm `lookup`).
+          auth:
+            existingSecret: langfuse-s3-platform
+            rootUserSecretKey: accessKey
+            rootPasswordSecretKey: secretKey
+
+          # SEAWEEDFS CANNOT CREATE A SINGLE VOLUME ON THE 5Gi DISK BELOW WITHOUT THIS. Its volume
+          # count is auto-sized from free disk against volumeSizeLimitMB (default 1000), and its
+          # first growth step wants 7 volumes, so a 5Gi disk yields none: every write is refused
+          # ("Not enough data nodes found!"), Langfuse logs "Failed to upload JSON to S3" with a
+          # 500, and OTLP ingest times out at the collector -- while every pod reports Ready. With
+          # volumeSizeLimitMB at 256 the same disk takes the traffic. Keep
+          # disk / volumeSizeLimitMB comfortably above 7 if you change either.
+          master:
+            volumeSizeLimitMB: 256
+
+          allInOne:
+            s3:
+              existingConfigSecret: langfuse-s3-platform
+            data:
+              # Default 50Gi -- the single largest default in the chart. This is where the raw event blobs land, so it grows with
+              # ingest and is bounded by project retention rather than by anything here.
+              size: 5Gi
+
+          # THE TWO FIDELITY DECISIONS WORTH MAKING, and one that is not available.
+          #
+          # Both of these are ON by default and neither is used by anything on this stack. Each is
+          # an unbounded blob-growth path into the object store, so leaving them on means paying
+          # storage for a capability nobody asked for.
+          mediaUpload:
+            # Multimodal attachments on traces -- images, audio, files. The agents here exchange
+            # text, so there is nothing to store. Note the upstream default cap is
+            # `maxContentLength: 1000000000`: **one gigabyte per attachment**. If a team turns this
+            # back on, set that to what their largest legitimate attachment actually is first.
+            enabled: false
+
+          batchExport:
+            # Writes CSV/JSON exports of trace data into the bucket when somebody requests one from
+            # the UI. Off until a team wants exports.
+            enabled: false
+
+          # NOT AVAILABLE, and it is the one that actually tracks volume: `s3.eventUpload` has no
+          # `enabled` flag. Langfuse writes every ingested event to the object store as a raw blob
+          # before it reaches ClickHouse -- that is its ingestion design, not a setting -- so blob
+          # growth tracks trace volume 1:1 and cannot be switched off.
+          #
+          # So the real lever on how much this stores is NOT in this chart. It is:
+          #
+          #   1. PROJECT DATA RETENTION, in days. Langfuse's retention job deletes both the
+          #      ClickHouse rows and the backing event blobs, so it bounds every tier at once. It
+          #      is a project property, settable at creation through
+          #      LANGFUSE_INIT_PROJECT_RETENTION or afterwards in the UI. Leaving it blank retains
+          #      forever, which is the default and the wrong one for an evaluation.
+          #   2. SAMPLING AT THE SOURCE. What never gets exported costs nothing to store. That is
+          #      an SDK/OTel-sampler decision in the agent, not a Langfuse one -- and it is the
+          #      only lever that also saves ingest and query cost rather than moving it.
+          #
+          # Evaluation sampling in gitops/charts/agent-evals is a different thing again: it bounds
+          # how many sessions get GRADED, which is judge model spend, not storage.
+
+  destination:
+    name: eks-agents
+    namespace: langfuse
+
+  # The gate is this file's place in the platform chart's excluded list, not a missing syncPolicy,
+  # so turning it on is one variable rather than an edit here plus an edit to the collector that
+  # nothing checks. prune: false, because the
+  # ClickHouse and Postgres volumes hold the trace history.
+  # A StatefulSet's volumeClaimTemplates are immutable, and the API server returns them with
+  # apiVersion, kind and `status: {phase: Pending}` the chart does not render, and the Bitnami
+  # Postgres StatefulSet stays OutOfSync after every successful sync. Ignoring the one field
+  # Kubernetes will not let anyone change loses nothing.
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jqPathExpressions:
+        - .spec.volumeClaimTemplates[]?
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # The ClickHouseCluster and KeeperCluster kinds come from the clickhouse-operator Application.
+      # Until its CRDs are registered, the dry run of those two resources fails; skipping it makes
+      # the apply fail instead, and the retry above repeats it.
+      - SkipDryRunOnMissingResource=true
+{{- end }}

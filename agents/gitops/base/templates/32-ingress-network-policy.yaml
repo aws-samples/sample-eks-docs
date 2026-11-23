@@ -1,0 +1,103 @@
+{{- if and .Values.ingress.enabled .Values.ingress.loadBalancerCidrs }}
+{{/*
+INGRESS FROM THE INGRESS LOAD BALANCER, for workloads this chart does not compose.
+
+An `Agent` gets this rule inside its own composed policy. This is for everything else that is
+exposed through the same ingress: the chat UI, an MCP server, anything a platform team puts
+behind a route itself.
+
+WHY IT IS NEEDED AT ALL. `31-namespaced-egress-policy.yaml` selects EVERY pod in the namespace
+(`podSelector: {}`) and declares `policyTypes: [Ingress, Egress]`, so each pod is selected for
+Ingress with one rule: from pods in the same namespace. An `ip` target group health-checks and
+forwards from the load balancer's ENIs, which are VPC addresses and not pods, so nothing matches and
+every inbound connection is dropped.
+
+WHAT IT LOOKS LIKE WHEN IT IS MISSING, for the chat UI: the Gateway is Programmed, the route
+Accepted, the listener rule correct, the login flow completes and sets its session cookie -- and the
+request then returns a `504` from `awselb/2.0` while the target sits `unhealthy / Target.Timeout`.
+Nothing names a network policy anywhere in that chain.
+
+OPT IN BY LABEL, not by selecting the namespace. A blanket rule would admit the load balancer to
+every pod in the namespace including the ones that are deliberately unreachable -- an execution-tier
+pod, an agent with `expose: none`. A workload says it is exposed by carrying
+`eks-agents/ingress: "true"`.
+*/}}
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ApplicationNetworkPolicy
+metadata:
+  name: eks-agents-ingress-network-policy
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  namespace: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  podSelector:
+    matchLabels:
+      eks-agents/ingress: "true"
+
+  policyTypes:
+    - Ingress
+    # EGRESS TOO, FOR ONE DESTINATION ONLY, and it is the destination that makes ingress
+    # usable rather than merely reachable. See the egress rule below.
+    - Egress
+
+  ingress:
+    # Same namespace, so this policy does not take away what the namespace-wide one allows. Policies
+    # are additive, but a reader should not have to know that to see that a peer can still call.
+    - from:
+        - podSelector: {}
+
+    - from:
+      {{- range .Values.ingress.loadBalancerCidrs }}
+        - ipBlock: { cidr: {{ . | quote }} }
+      {{- end }}
+      ports:
+      {{- range .Values.ingress.exposedPorts }}
+        - protocol: TCP
+          port: {{ . }}
+      {{- end }}
+
+  egress:
+    {{/*
+    THE LOAD BALANCER'S SIGNING KEY, which is on the public internet.
+
+    A workload behind a browser gate does not trust `x-amzn-oidc-data` because it arrived -- it
+    verifies the signature against the REGIONAL public key endpoint, fetching the key named by the
+    token's `kid`. That endpoint is outside the VPC, and the egress boundary permits the model
+    gateway and nothing else, so the fetch times out and the workload fails closed:
+
+      chat-ui refused a request: cannot fetch the ALB signing key at
+      https://public-keys.auth.elb.us-west-2.amazonaws.com/<kid>: <urlopen error timed out>
+
+    This happens after a login that completes successfully. The person has a valid session and gets
+    a 401, and nothing in the chain names a network policy.
+
+    Scoped to one hostname, for the labelled pods only. A workload that verifies no ALB header does
+    not need it, and the label is what says a workload is behind ingress.
+    */}}
+    - to:
+        - domainNames:
+            - {{ printf "public-keys.auth.elb.%s.amazonaws.com" .Values.region | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # DNS, because a domainName rule is resolved by the workload first. Without this the hostname
+    # above never resolves and the rule governs traffic that is never sent. Port 53 to the resolver
+    # ranges the agents' own DNS rule uses (networkPolicy.dnsDestinations, which holds every resolver
+    # an EKS pod uses, CoreDNS included), not to a resolver on a public address.
+    - to:
+        {{- range .Values.networkPolicy.dnsDestinations }}
+        - ipBlock: { cidr: {{ . | quote }} }
+        {{- end }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+
+    # The agents this workload calls, in the same namespace. A chat UI with no route to the agent is
+    # a login page in front of nothing.
+    - to:
+        - podSelector: {}
+{{- end }}

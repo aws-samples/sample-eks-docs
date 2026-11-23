@@ -1,0 +1,130 @@
+{{- if not (has "30-agentgateway.yaml" .Values.excluded) }}
+# AgentGateway: the egress point, the credential broker, and the one audit point for every call any
+# agent made.
+#
+# What this layer buys, over the base layer of per-agent identity plus hostname egress policy:
+# per-agent token budgets, model selection and failover, tool-level policy, prompt and response
+# checks, argument-level tool checks, response masking, and credential brokering for the services
+# that issue only long-lived tokens. Everything on that list needs the request in view, which is
+# exactly what the base layer cannot do.
+#
+# What it costs:
+#   - The platform team operates it.
+#   - Agents address it, so pointing an agent at the gateway is part of the deployment contract.
+#     That works because the platform team builds or packages the agents itself; where it does not,
+#     the mesh in 20-istio.yaml is what makes arrival enforced instead.
+#   - Brokering concentrates every agent's credentials for every destination into one process, which
+#     the base layer did not have at all. This is the highest-value target in the architecture.
+#     Its namespace is not a tenant namespace, its role is not reusable, and the secrets it reads
+#     are readable by it alone — see terraform/modules/egress-agentgateway.
+#
+# How it knows which agent is calling: the agent presents its own service account token, which the
+# gateway validates against the cluster's OIDC issuer. So per-agent routing, policy and budgets work
+# with no mesh and no certificate authority to run.
+#
+# Before adopting the credential half of this, establish which parts sit in the open-source project
+# and which sit in its vendor's commercial distribution. The token vault behind consented access is
+# documented as the latter.
+#
+# The CRDs are NOT in this chart. They are a separate one, installed by 29-agentgateway-crds.yaml in
+# an earlier sync wave; this chart contains only RBAC, a Deployment, a Service and a ServiceAccount.
+# Without them the controller comes up and crashloops waiting to sync informers for kinds that do
+# not exist.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agentgateway
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: cr.agentgateway.dev/charts
+    chart: agentgateway
+    targetRevision: v1.7.0
+
+    helm:
+      valuesObject:
+        # Must match gateway_service_account in terraform/modules/egress-agentgateway, or the Pod
+        # Identity association delivers credentials to a service account nothing uses and the
+        # gateway cannot assume any agent's role. The symptom is every model call failing with no
+        # credentials found, on a gateway that looks healthy.
+        serviceAccount:
+          create: true
+          name: agentgateway
+
+        # More than one replica. The gateway is in the path of every call every agent makes, so a
+        # single replica makes it a single point of failure for the whole platform — and MCP session
+        # routing works across replicas, so there is no affinity reason to run one.
+        replicaCount: 2
+
+        podDisruptionBudget:
+          enabled: true
+          minAvailable: 1
+
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: "2"
+            memory: 2Gi
+
+        # The gateway is not itself an agent and is not sandboxed. It is the component that holds
+        # every credential, so it runs with the ordinary hardening rather than inside a sandbox:
+        # the sandbox protects the node from untrusted code, and the gateway runs no untrusted code.
+        securityContext:
+          runAsNonRoot: true
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+
+  destination:
+    name: eks-agents
+    namespace: agentgateway-system
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: true
+      selfHeal: true
+
+    # Enrol the gateway's own namespace in the mesh.
+    #
+    # This namespace is created by this Application rather than by the base chart, so nothing else
+    # can label it -- and without the label the gateway pods are not in the mesh at all. Two things
+    # that read as working are then false: `gateway-allow-agents-only` in
+    # gitops/base/templates/50-mesh-authz.yaml lands on a namespace with no enrolled workload and is
+    # inert while reporting Accepted, and the claim that arrival at the gateway is enforced rather
+    # than agreed does not hold. Without the label, a successful model call from an agent produces
+    # no ztunnel access log on any node.
+    #
+    # Set unconditionally rather than per mesh mode, because ambient is the only mesh mode. A
+    # cluster running mesh.mode=none has no ztunnel, and the label is then inert rather than harmful.
+    managedNamespaceMetadata:
+      labels:
+        istio.io/dataplane-mode: ambient
+
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+{{- end }}

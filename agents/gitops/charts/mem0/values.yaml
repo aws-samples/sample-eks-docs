@@ -1,0 +1,112 @@
+# Mem0: memory rung 3, consolidation.
+#
+# ---------------------------------------------------------------------------
+# DO NOT RUN THE PUBLISHED IMAGE. BUILD IT, OR USE THE LIBRARY.
+# ---------------------------------------------------------------------------
+#
+# The project is actively maintained and released on PyPI. The published container,
+# `mem0/mem0-api-server`, carries only a `latest` tag: there is no versioned tag to pin and no
+# release note to read, and an image that is not rebuilt with the source does not carry the
+# dependency fixes the source receives. Digest-pinning it would make the version reproducible and
+# any vulnerabilities it carries permanent.
+#
+# So this chart defaults to an image you build. image.repository is empty and the chart refuses to
+# render until it is set, rather than quietly falling back to Docker Hub.
+#
+#   # Build from the upstream source into the ECR repository the cluster module created:
+#   git clone --depth 1 https://github.com/mem0ai/mem0.git && cd mem0/server
+#   docker build -t "$ECR/agents/mem0:$(git -C .. rev-parse --short HEAD)" .
+#   docker push "$ECR/agents/mem0:$(git -C .. rev-parse --short HEAD)"
+#
+# Scan-on-push and immutable tags are already set on those repositories, so the result is pinnable,
+# patched and scanned — which is the whole argument for the registry being where image governance
+# lives on this stack.
+#
+# ---------------------------------------------------------------------------
+# CONSIDER NOT RUNNING A SERVER AT ALL
+# ---------------------------------------------------------------------------
+#
+# `mem0ai` on PyPI is actively released and is the same consolidation logic as a library. An agent
+# that already holds the model connection and the vector store can call it in-process, and then
+# rung 3 is a dependency in apps/reference/requirements.txt rather than a tier with its own
+# Deployment, its own database credentials and its own image to keep patched.
+#
+# For the rung most teams never reach, that is the right weight. Run the server when something other
+# than the agent needs to read the memories — a second agent, or an application outside the cluster
+# — which is the case that justifies a service.
+#
+# ---------------------------------------------------------------------------
+#
+# Two more things about this rung, true whichever way it is consumed:
+#
+#   It depends on rung 2. Mem0 stores consolidated memories in a vector store and its metadata in
+#   Postgres, so enabling consolidation means enabling semantic recall first.
+#
+#   It costs a model call per consolidation, to decide what is worth keeping and to reconcile a new
+#   statement against what is stored. That call goes through the gateway like every other, so it
+#   lands in the same budget and audit point.
+#
+# The managed alternative is AgentCore Memory in terraform/modules/memory-aws. It has no
+# Kubernetes-native interface, which is a real asymmetry the agents-memory page of the EKS User
+# Guide records, and
+# is also the reason a team on this path might still prefer self-hosting.
+
+image:
+  # Required. Your own ECR repository, from the ecr_repository_urls Terraform output — not
+  # mem0/mem0-api-server. See the header.
+  repository: ""
+
+  # The upstream commit you built from, which is the only honest version string available: the
+  # project tags PyPI releases but not server images.
+  tag: ""
+
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+# Mem0's own metadata store and its vector store.
+#
+# Both point at the Postgres the semantic-recall rung creates — one cluster, two roles — which is
+# why rung 3 depends on rung 2. Neither is a chart value, because a connection string contains a
+# password: the chart reads both from a Secret the platform team creates out of band.
+#
+#   kubectl -n agent-memory create secret generic mem0-db \
+#     --from-literal=postgres-url='postgresql://agent:...@agent-semantic-recall-cluster-rw:5432/agentmemory' \
+#     --from-literal=vector-url='postgresql://agent:...@agent-semantic-recall-cluster-rw:5432/agentmemory'
+database:
+  existingSecret: mem0-db
+  postgresUrlKey: postgres-url
+  vectorUrlKey: vector-url
+
+# The model Mem0 calls to consolidate. Through the egress gateway like every other model call on
+# this stack, so Mem0 holds no model credential and its spend lands in the same per-agent budget and
+# audit point as the agents' own calls. Point it at the gateway, not at Bedrock.
+llm:
+  # Mem0 is not an agent and has no per-agent identity, so on a cluster using per-agent role
+  # assumption it needs its own entry in the gateway's agents map to get a path and a role.
+  baseUrl: ""
+  model: bedrock-claude-sonnet
+  # Not a credential. The gateway identifies callers from the service account token the pod
+  # projects; this field exists because the client library requires it.
+  apiKeyPlaceholder: unused-gateway-identifies-the-caller-from-its-token
+
+service:
+  port: 8000
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 2Gi
+
+# Mem0 is not an agent and is not sandboxed: the sandbox protects the node from untrusted code, and
+# Mem0 runs none. It still gets the ordinary hardening, and it sits in agent-memory rather than an
+# agent namespace so the admission policy does not require a runtime class of it.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault

@@ -1,0 +1,95 @@
+{{- if not (has "45-cert-manager.yaml" .Values.excluded) }}
+# cert-manager, so the OpenTelemetry operator's admission webhooks have a certificate that survives
+# a GitOps reconcile.
+#
+# WHY THIS EXISTS, because adding a cluster-wide component to a cluster whose point is agents
+# deserves a reason. The operator chart offers two ways to certify its webhooks, and only one of
+# them works when Argo CD is the thing applying the chart.
+#
+# `autoGenerateCert.enabled` -- the obvious choice -- builds the CA and the
+# serving certificate with Helm's `genCA`/`genSignedCert` AT RENDER TIME. Those functions are not
+# idempotent: every render produces a different CA. The webhook configurations are ordinary
+# resources, so they carry the CA from whichever render last applied them, while the serving
+# certificate is a Secret annotated
+#
+#   helm.sh/hook: pre-install,pre-upgrade
+#   helm.sh/hook-delete-policy: before-hook-creation
+#
+# which Argo CD applies on a different schedule and deletes before recreating. The two therefore
+# come from different renders and permanently disagree. The symptom: the webhook caBundle and the
+# Secret's own ca.crt differ, the API server logs `remote error: tls: bad certificate`, and every
+# attempt to create the collector fails with
+#
+#   Internal error occurred: failed calling webhook "mopentelemetrycollectorbeta.kb.io":
+#   x509: certificate signed by unknown authority ... "opentelemetry-operator-operator-ca"
+#
+# while the operator itself reports Healthy. Restarting the operator does not help, because the
+# operator is not what generates the certificate -- Helm is. The collector-relevant webhooks are
+# `failurePolicy: Fail`, so there is nothing to tolerate either: they have to be certified or
+# removed.
+#
+# cert-manager issues the certificate in-cluster and keeps the caBundle injected, so the two sides
+# cannot drift. It is the chart's supported path and the only one that is idempotent under GitOps.
+#
+# WHAT IT COSTS. One cluster-wide component to run and upgrade, plus its CRDs. The open source path
+# installs it too, for the ClickHouse operator behind Langfuse (51-langfuse.yaml), so a team running
+# both paths operates it either way.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cert-manager
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    # Before the OpenTelemetry operator at -1, because the operator's webhooks reference an Issuer
+    # and a Certificate that have to exist first. A wave is not a readiness gate on its own, which
+    # is why the operator Application also carries a retry below.
+    argocd.argoproj.io/sync-wave: "-6"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://charts.jetstack.io
+    chart: cert-manager
+    targetRevision: v1.19.1
+
+    helm:
+      valuesObject:
+        # The CRDs come with the chart rather than from a separate apply, so there is one object to
+        # review and one thing to roll back. Note the pruning note on the Application below: these
+        # are CRDs, and pruning them takes every Certificate and Issuer on the cluster with them.
+        crds:
+          enabled: true
+          keep: true
+
+  destination:
+    name: eks-agents
+    namespace: cert-manager
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, several Applications
+    # can each spend minutes retrying with backoff that grows to minutes, and a chart that syncs
+    # in seconds waits behind them. Capped at 30 s, a transient failure costs seconds; the
+    # higher limit keeps the total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      # Carries CRDs. Pruning a CRD deletes every resource defined against it, including
+      # certificates issued for components that have nothing to do with this stack.
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+{{- end }}

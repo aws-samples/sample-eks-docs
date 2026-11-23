@@ -1,0 +1,349 @@
+{{/*
+The policies: what the gateway decides once a request has arrived and been attributed to an agent.
+
+Three buckets, by what they attach to:
+
+  traffic    token budgets and authorization, on the Gateway or a route
+  backend    MCP tool authorization and guardrail processors, on a backend
+  frontend   connection handling and L4 authorization, on a listener
+
+This is the authoring surface the base layer does not have, because every rule here needs the request
+in view. It is also one of several places a platform team writes policy for one agent on this stack,
+and none of them validates against the others.
+
+Every rule below decides a call on what it can see at the moment the call is made; none expresses a
+rule about the order of calls within a session.
+*/}}
+{{- if .Values.budgets.enabled }}
+---
+{{/*
+Per-agent token budget.
+
+This is the control the base layer cannot express at all, because it needs to see the request.
+
+`local` rather than `global`: a local limit is enforced in the proxy with no rate-limit service to
+run, which suits a per-identity token ceiling. `global` is the shape to move to when the budget has
+to hold across gateway replicas exactly rather than approximately — it needs a rate-limit service
+behind `global.backendRef`, which is another component to operate.
+
+Keyed on the verified caller, so the budget is per agent. One fleet-wide budget tells a platform team
+nothing about which agent spent it.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: model-budget
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  targetRefs:
+    # The Gateway, not a backend. A `traffic` policy may only target a Gateway, ListenerSet,
+    # GRPCRoute, HTTPRoute or InferencePool -- the CRD rejects a Backend target outright:
+    #   the 'traffic' field can only target a Gateway, ListenerSet, GRPCRoute, HTTPRoute,
+    #   or InferencePool
+    # Targeting the Gateway means the budget covers every route through it, which is what a
+    # per-agent token ceiling should do anyway: an agent that switched from /llm to /mcp should not
+    # get a fresh allowance.
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $.Values.gateway.name }}
+
+  traffic:
+    rateLimit:
+      local:
+        - key: jwt.sub
+          tokens: {{ .Values.budgets.default.tokensPerHour }}
+          unit: Hours
+        {{- range $agent, $budget := .Values.budgets.perAgent }}
+        # {{ $agent }}, overriding the default above.
+        - key: 'jwt.sub == "system:serviceaccount:{{ $.Values.namespaces.reasoning }}:{{ $agent }}" ? jwt.sub : ""'
+          tokens: {{ $budget.tokensPerHour }}
+          unit: Hours
+        {{- end }}
+{{- end }}
+{{- if and .Values.toolPolicy.enabled .Values.mcpServers }}
+---
+{{/*
+Tool-level authorization, evaluated where the arguments are in view.
+
+A denylist rather than an allowlist, which is the weaker shape in general and the right one here: the
+catalogue behind an aggregated MCP endpoint changes without this file changing, so an allowlist would
+silently refuse new tools and an operator would debug it as an outage. Add
+toolPolicy.extraExpressions for the agent-specific rules that do need to be positive.
+
+Note the shape: `action` is a sibling of `policy`, not a field inside it.
+
+REQUIRE, NOT ALLOW, because the expressions are ANDed only under Require. The CRD: under `Allow`, "any
+matching allow rule allows the request"; under `Require`, "every require rule must match". With
+`Allow` this policy is an OR -- an extraExpression that holds lets a denied tool through, and a rule
+meant to refuse (the person-token rule below) refuses nothing, so an agent without person access
+could call a person tool with a person's token. Every expression here is a condition the call must
+meet, so each must hold.
+
+DEFENSIVE EXPRESSIONS. Under Require an expression that errors fails the call, so each one reads
+only what every MCP request carries, or tests for presence first.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: mcp-tool-policy
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  targetRefs:
+    - group: agentgateway.dev
+      kind: AgentgatewayBackend
+      name: mcp-servers
+    {{- if (((.Values.personAccess | default dict).tokenExchange | default dict).enabled) }}
+    # The same rules on the person-token backend (person_access_delegated_token).
+    - group: agentgateway.dev
+      kind: AgentgatewayBackend
+      name: mcp-servers-person
+    {{- end }}
+
+  backend:
+    mcp:
+      authorization:
+        action: Require
+        policy:
+          matchExpressions:
+            {{- with .Values.toolPolicy.deniedTools }}
+            - >-
+              !([{{ range $i, $t := . }}{{ if $i }}, {{ end }}"{{ $t }}"{{ end }}].contains(mcp.tool.name))
+            {{- end }}
+            {{- range .Values.toolPolicy.extraExpressions }}
+            - {{ . | quote }}
+            {{- end }}
+            {{- $pa := .Values.personAccess | default dict }}
+            {{- if and $pa.enabled $pa.agents }}
+            # ON-BEHALF-OF IS THE INTERSECTION OF THE PERSON AND THE AGENT. A tool call that carries a
+            # person's token is allowed only from an agent the platform gave person access
+            # (person_access_agents). The tool still verifies the person; this is the agent side, so a
+            # valid person token sent through any other agent is refused here, before the tool.
+            - >-
+              !("x-person-token" in request.headers) ||
+              jwt.sub in [{{ range $i, $a := $pa.agents }}{{ if $i }}, {{ end }}"system:serviceaccount:{{ $.Values.namespaces.reasoning }}:{{ $a }}"{{ end }}]
+            {{- end }}
+            {{- if and (not .Values.toolPolicy.deniedTools) (not .Values.toolPolicy.extraExpressions) (not (and $pa.enabled $pa.agents)) }}
+            # No rules configured. Deny rather than allow everything, so an enabled tool policy with
+            # an empty configuration fails closed and is noticed.
+            - "false"
+            {{- end }}
+{{- end }}
+{{- if (.Values.requestMetrics | default dict).callerLabel }}
+---
+{{/*
+The calling agent on every request metric.
+
+agentgateway_requests_total carries route and status but not who called, so a refusal cannot be
+placed with an agent. This adds the verified token's subject as a label, `unauthenticated` when no
+valid token came (the 401s). The policy decisions dashboard in gitops/charts/agent-dashboards reads
+it: a call from the research agent is labelled agent="system:serviceaccount:agents:research", a
+call with a bad token agent="unauthenticated".
+
+A second frontend policy on the same Gateway as transparent-egress below: both report Accepted and
+Attached, and each sets a different field.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: request-metrics
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $.Values.gateway.name }}
+  frontend:
+    metrics:
+      attributes:
+        add:
+          - name: {{ .Values.requestMetrics.callerLabel }}
+            expression: 'has(jwt.sub) ? jwt.sub : "unauthenticated"'
+{{- end }}
+{{- if .Values.gateway.capturedEgress }}
+---
+{{/*
+Connection handling for transparently captured egress.
+
+With Istio ambient in the path, ztunnel delivers the agent's connection as a CONNECT to the real
+host. `mode: Route` terminates that tunnel and routes the inner request through the gateway's own
+rules, which is what lets the hostname routes in 20-routes.yaml match.
+
+The enum is Deny | Route | Tunnel, not Terminate:
+  Deny    refuse CONNECT outright, for a gateway that should only see ordinary requests
+  Route   terminate and route the inner request -- what this stack wants
+  Tunnel  pass the tunnel through unexamined, which gives up every control that needs the request
+
+Set gateway.capturedEgress to false when the mesh is not in the path: there is no CONNECT to handle,
+and agents address the Gateway directly.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: transparent-egress
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  targetRefs:
+    # No sectionName. The CRD refuses a listener-scoped target for these:
+    #   frontend tcp, networkAuthorization, tls, http, proxyProtocol, and connect policies may
+    #   only target a Gateway or port, not a listener (sectionName)
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $.Values.gateway.name }}
+
+  frontend:
+    connect:
+      mode: Route
+
+    # networkAuthorization IS NOT ATTACHED, and this is the reason rather than an omission.
+    #
+    # It is evaluated against the `connect` context, which exists only for CONNECT traffic -- the
+    # shape a captured connection arrives as. For an ordinary HTTP request to the gateway's own
+    # route, `connect` is absent, so every expression referencing it errors and the policy fails
+    # closed: `true` is allowed, while `connect.authority == ""`, `size(connect.authority) == 0`,
+    # `!has(connect.authority)`, `.contains("egress")` and
+    # `.startsWith("egress.agentgateway-system...")` are every one denied. There is no expression
+    # that admits a direct request.
+    #
+    # And with capture on, BOTH shapes arrive at this one Gateway: CONNECT for a third-party host
+    # ztunnel tunnelled, and plain HTTP for the model route the agent addresses by name. So a single
+    # expression cannot serve both, and attaching one denies the documented contract that an agent
+    # addresses the gateway.
+    #
+    # WHAT ENFORCES EGRESS INSTEAD. The route table: a captured connection aimed at a host with no
+    # HTTPRoute reaches no backend. That is a refusal after route evaluation rather than before it,
+    # which is the property given up here. Standing behind it, unchanged, are the cluster-scoped
+    # network policy -- which permits only this gateway and DNS out of an agent namespace -- and the
+    # gateway's own inbound JWT authentication.
+    #
+    # TO GET THE PRE-ROUTE REFUSAL BACK, separate the two shapes onto their own Gateways: one for
+    # captured egress carrying this policy, one for the model and tool routes carrying none. Two
+    # Gateway objects, two data planes to operate. Not done here, because the CRD refuses a
+    # listener-scoped target for these policies -- they may target a Gateway or a port only -- so
+    # there is no way to scope it within one Gateway.
+{{- end }}
+
+{{- if .Values.model.fallbackModelIds }}
+{{- if .Values.model.perAgentRoleAssumption }}
+{{- range $name, $agent := .Values.agents }}
+---
+{{/*
+The other half of failover: a provider has to be EVICTED before the next priority group is reached.
+
+Priority groups in 10-backends.yaml define the ORDER and nothing else. Without a health policy the
+first group is the only group that is ever used, because the load balancer has no reason to skip it,
+and an operator reading a backend with two groups has every reason to think failover is configured.
+So this file and that one ship together or neither does.
+
+WHAT COUNTS AS UNHEALTHY, and why 429 is in it. Evicting on 5xx is the obvious half. Including 429 is
+what makes a THROTTLED primary fail over rather than returning the throttle to the agent, which is
+the common case this exists for: Bedrock rate-limits a model, not the account.
+
+The throttle the GATEWAY itself returns is a different thing and must not evict anything. A token
+budget rejection is a local decision, not a provider response, so it never reaches this condition --
+an agent that has spent its budget gets a 429 instead of silently spending the fallback model.
+
+evictionConsecutiveFailures of 1 evicts on the first bad response, so a throttled primary fails over
+immediately. Raise it to tolerate a blip at the cost of a slower failover. evictionDuration is the
+base window and grows multiplicatively on repeated evictions, so a persistently broken model costs
+about one failed attempt per widening window. If every provider is evicted the load balancer returns
+an evicted one rather than failing, so the floor is the primary rather than an error.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: model-failover-health-{{ $name }}
+  namespace: {{ $.Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/agent: {{ $name }}
+spec:
+  targetRefs:
+    # The whole backend, with no sectionName: every provider in every group is subject to it. A
+    # sectionName here would name one provider, which is the shape to use when one model needs a
+    # different threshold than the rest.
+    - group: agentgateway.dev
+      kind: AgentgatewayBackend
+      name: bedrock-{{ $name }}
+  backend:
+    health:
+      unhealthyCondition: {{ $.Values.model.failover.unhealthyCondition | quote }}
+      eviction:
+        duration: {{ $.Values.model.failover.evictionDuration | quote }}
+        consecutiveFailures: {{ $.Values.model.failover.evictionConsecutiveFailures }}
+{{- end }}
+---
+{{/*
+And the third piece, without which failover is still visible to the agent.
+
+Eviction takes effect after the response that caused it, so the first failing call still returns the
+error to the caller unless a retry re-attempts inside the same client call -- and a retry only fires
+for a status code listed in `retryCodes`. Health without retry is failover the agent sees; retry
+without health re-attempts against the same primary.
+
+A code in unhealthyCondition but not in retryCodes evicts the provider without retrying: the call
+that triggered the eviction returns its error to the client, and later calls are served by the
+fallback. A code in both -- 429 and the 5xx family, which is what a throttled or broken provider
+actually returns -- is re-attempted inside the same call and the failover is then invisible.
+Transparency is a property of the code being in both lists, not of the two policies existing.
+
+Attached to the route rather than the backend because that is where the CRD takes it: traffic
+policies apply to an HTTPRoute, and `retry` is ignored on other kinds.
+
+Retrying buffers the request body in memory for replay. For chat completions that is the prompt,
+which is the reason `attempts` is small here rather than generous.
+*/}}
+{{- if .Values.agents }}
+{{/*
+GUARDED ON A NON-EMPTY AGENT LIST, because targetRefs is built by ranging over it and an empty list
+is not a valid policy:
+
+  AgentgatewayPolicy "model-failover-retry" is invalid: spec: Invalid value: exactly one of the
+  fields in [targetRefs targetSelectors] must be set
+
+`agents` is empty exactly when the agent resource definition is on -- which is the default -- so
+without the guard this renders an unapplyable object on the common path and a working one only
+where the platform team declares agents in Terraform. On the resource-definition path each Agent
+composes its own retry policy alongside its backend and route, so nothing is lost here.
+
+Without it, `helm upgrade` of this chart fails on exactly that message with agents unset, after the
+base chart has already upgraded.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: model-failover-retry
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  targetRefs:
+    {{- range $name, $agent := .Values.agents }}
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: llm-{{ $name }}
+    {{- end }}
+  traffic:
+    retry:
+      attempts: {{ .Values.model.failover.retryAttempts }}
+      backoff: {{ .Values.model.failover.retryBackoff | quote }}
+      codes:
+        {{- range .Values.model.failover.retryCodes }}
+        - {{ . }}
+        {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

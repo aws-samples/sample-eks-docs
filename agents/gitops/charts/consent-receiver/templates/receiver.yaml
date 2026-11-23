@@ -1,0 +1,141 @@
+{{- if .Values.consent.enabled }}
+{{- $image := index .Values.registry "agents/consent-receiver" | default "" }}
+{{- if not $image }}{{ fail "consent.enabled but registry has no agents/consent-receiver: build it (apps/consent-receiver) and let terraform-values.yaml name it" }}{{ end }}
+{{- if not .Values.consent.clients }}{{ fail "consent.enabled with no clients: set oauth_consent in Terraform" }}{{ end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.consent.serviceAccount }}
+  namespace: {{ .Values.consent.namespace }}
+  labels: {app.kubernetes.io/part-of: eks-agents-paved-paths, eks-agents-ai-docs: "true"}
+automountServiceAccountToken: true
+---
+# NO SERVICE. The receiver binds 127.0.0.1 and is reached with
+#   kubectl -n {{ .Values.consent.namespace }} port-forward deploy/consent-receiver {{ .Values.consent.port }}
+# so who may grant a consent is decided by the cluster's authentication and pods/portforward RBAC.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consent-receiver
+  namespace: {{ .Values.consent.namespace }}
+  labels: {app.kubernetes.io/part-of: eks-agents-paved-paths, eks-agents-ai-docs: "true", app.kubernetes.io/name: consent-receiver}
+spec:
+  replicas: 1   # the OAuth state is in memory: a callback must reach the pod that issued it
+  selector:
+    matchLabels: {app.kubernetes.io/name: consent-receiver}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/part-of: eks-agents-paved-paths, eks-agents-ai-docs: "true", app.kubernetes.io/name: consent-receiver}
+    spec:
+      serviceAccountName: {{ .Values.consent.serviceAccount }}
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: receiver
+          image: {{ printf "%s:%s" $image .Values.imageTag | quote }}
+          env:
+            - {name: CONSENT_CLIENTS, value: {{ toJson .Values.consent.clients | quote }}}
+            - {name: PUBLIC_BASE_URL, value: {{ .Values.consent.publicBaseUrl | quote }}}
+            - {name: PORT, value: {{ .Values.consent.port | quote }}}
+            - {name: BIND_ADDRESS, value: "127.0.0.1"}
+            - {name: SYNCER_NAMESPACE, value: {{ .Values.consent.syncer.namespace | quote }}}
+            - {name: SYNCER_DEPLOYMENT, value: {{ .Values.consent.syncer.deployment | quote }}}
+            - {name: AWS_REGION, value: {{ .Values.region | quote }}}
+          # exec, not httpGet: the server listens on loopback, which the kubelet cannot dial.
+          readinessProbe:
+            exec:
+              command: ["python", "-c", "import urllib.request,os;urllib.request.urlopen('http://127.0.0.1:'+os.environ['PORT']+'/healthz',timeout=3)"]
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 96Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: tmp, emptyDir: {}}
+---
+# Nothing in the cluster may connect to it; port-forward does not pass through network policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: consent-receiver-no-ingress
+  namespace: {{ .Values.consent.namespace }}
+  labels: {app.kubernetes.io/part-of: eks-agents-paved-paths, eks-agents-ai-docs: "true"}
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: consent-receiver}
+  policyTypes: [Ingress]
+{{- $syncer := false }}
+{{- $minters := dict }}
+{{- range $name, $c := .Values.consent.clients }}
+{{- if eq ($c.mode | default "") "agentcore" }}
+{{- $_ := set $minters $c.agentNamespace (append (get $minters $c.agentNamespace | default list) $c.agent) }}
+{{- else }}
+{{- $syncer = true }}
+{{- end }}
+{{- end }}
+{{- range $ns, $agents := $minters }}
+---
+# AgentCore mode: mint a token for the named agents' service accounts only, to complete the session
+# binding AgentCore Gateway's consent requires. Nothing else in the namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: consent-receiver-mint-agent-token
+  namespace: {{ $ns }}
+  labels: {app.kubernetes.io/part-of: eks-agents-paved-paths, eks-agents-ai-docs: "true"}
+rules:
+  - apiGroups: [""]
+    resources: [serviceaccounts/token]
+    resourceNames: {{ toJson (uniq $agents) }}
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: consent-receiver-mint-agent-token
+  namespace: {{ $ns }}
+  labels: {app.kubernetes.io/part-of: eks-agents-paved-paths, eks-agents-ai-docs: "true"}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: consent-receiver-mint-agent-token}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $.Values.consent.serviceAccount }}
+    namespace: {{ $.Values.consent.namespace }}
+{{- end }}
+{{- if $syncer }}
+---
+# The one thing it may do in the cluster: roll the secrets syncer in the gateway's namespace, so the
+# CSI driver mounts the new value. resourceNames pins it to that Deployment.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: consent-receiver-restart-syncer
+  namespace: {{ .Values.consent.syncer.namespace }}
+  labels: {app.kubernetes.io/part-of: eks-agents-paved-paths, eks-agents-ai-docs: "true"}
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [{{ .Values.consent.syncer.deployment | quote }}]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: consent-receiver-restart-syncer
+  namespace: {{ .Values.consent.syncer.namespace }}
+  labels: {app.kubernetes.io/part-of: eks-agents-paved-paths, eks-agents-ai-docs: "true"}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: consent-receiver-restart-syncer}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.consent.serviceAccount }}
+    namespace: {{ .Values.consent.namespace }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,146 @@
+{{/*
+The two admission rules written once for the cluster: that an agent lands in a sandbox, and that no
+pod can ask for the node's own network.
+
+These are the first two rows of the policy table on the agents-network-policies page of the EKS
+User Guide, and the only ones on this stack written once rather than per agent.
+
+Why they are here and not left to the pod spec. A runtimeClassName an author can omit is a
+convention, not a boundary: the pod that forgets it runs on the node's kernel next to every other
+agent, and nothing reports that it was supposed to be isolated. A hostNetwork a pod may request
+reaches instance metadata whatever the node's metadata setting says, which hands that agent the
+node's IAM role and every permission attached to it, regardless of what the agent's own role
+allows. Sandboxed pods cannot take that route anyway, because hostNetwork is not available to them
+-- but the gate has to refuse the pod that is not sandboxed, which is exactly the pod the first
+rule would otherwise have let through.
+
+ValidatingAdmissionPolicy rather than a webhook. There is no controller to run, nothing to keep
+certificates current for, and no failure mode where the gate is down and pods are admitted anyway.
+*/}}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: eks-agents-sandbox-required
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  # Fail, not Ignore. Ignore would admit the pod when the policy cannot be evaluated, which is the
+  # one case where a gate is most likely to matter.
+  failurePolicy: Fail
+
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+
+  variables:
+    - name: runtimeClass
+      expression: "has(object.spec.runtimeClassName) ? object.spec.runtimeClassName : ''"
+
+  validations:
+    {{/*
+    Rule 1: the pod is in a sandbox.
+    */}}
+    - expression: >-
+        variables.runtimeClass in [{{ if .Values.admission.allowConfidentialSandbox }}'isolated-sandbox', 'confidential-sandbox'{{ else }}'isolated-sandbox'{{ end }}]
+      reason: Forbidden
+      messageExpression: >-
+        "pod must run in a Nitro sandbox: set spec.runtimeClassName to isolated-sandbox. Got " +
+        (variables.runtimeClass == "" ? "no runtime class" : "'" + variables.runtimeClass + "'") +
+        ". A pod without it runs on the node's own kernel next to every other agent."
+
+    {{/*
+    Rule 2: no host network.
+
+    The gap this closes exists on both EKS Auto Mode and EKS on EC2. On Auto Mode the instance
+    metadata hop limit that keeps ordinary pods away from the node's credentials is set by EKS and
+    cannot be changed; on EC2 the platform team sets it themselves. Neither covers a pod with host
+    networking, which reaches metadata whatever that setting says.
+    */}}
+    - expression: "!has(object.spec.hostNetwork) || !object.spec.hostNetwork"
+      reason: Forbidden
+      message: >-
+        hostNetwork is not permitted. A pod on the host network reaches instance metadata whatever
+        the node's metadata setting says, which gives it the node's IAM role and every permission
+        attached to it, regardless of what the agent's own role allows.
+
+    {{/*
+    The same escape, by two other doors. A pod sharing the host PID namespace can read another
+    process's environment and memory, including credentials; a pod sharing the host IPC namespace
+    reaches shared memory segments the node's own components use. Neither is available to a
+    sandboxed pod, so these refuse the shapes that would arrive alongside a missing runtime class.
+    */}}
+    - expression: "!has(object.spec.hostPID) || !object.spec.hostPID"
+      reason: Forbidden
+      message: "hostPID is not permitted: it exposes every other process on the node, and their credentials, to this pod."
+
+    - expression: "!has(object.spec.hostIPC) || !object.spec.hostIPC"
+      reason: Forbidden
+      message: "hostIPC is not permitted: it exposes the node's shared memory to this pod."
+
+    {{/*
+    Rule 5: no Istio sidecar, in any mode.
+
+    The stack has no sidecar mode (the agents-mesh page of the EKS User Guide). A sidecar appearing
+    in an agent namespace is a misconfiguration that does not announce itself: Istio resolves a
+    namespace labelled for both data planes in favour of sidecar, so a stray istio-injection=enabled
+    replaces per-node capture with per-pod injection, silently, without changing a single manifest
+    in this repository -- and puts a mesh private key inside the pod that runs model-generated code.
+    Pod Security restricted refuses istio-init on its own (NET_ADMIN, NET_RAW, root), but with a
+    message about capabilities; this rule names the cause.
+
+    Checked on the annotation and on the injected container, because the two arrive by different
+    routes: the annotation is what an author writes, and the container is what the webhook adds when
+    the NAMESPACE is labelled and the pod says nothing at all.
+    */}}
+    - expression: >-
+        !has(object.metadata.annotations) ||
+        !('sidecar.istio.io/inject' in object.metadata.annotations) ||
+        object.metadata.annotations['sidecar.istio.io/inject'] == 'false'
+      reason: Forbidden
+      message: >-
+        This pod requests Istio sidecar injection, which an agent namespace does not run: the mesh,
+        when there is one, is ambient (mesh.mode {{ include "mesh.mode" . | quote }} here). Remove the
+        sidecar.istio.io/inject annotation. See https://docs.aws.amazon.com/eks/latest/userguide/agents-mesh.html.
+
+    - expression: >-
+        !object.spec.containers.exists(c, c.name == 'istio-proxy') &&
+        (!has(object.spec.initContainers) || !object.spec.initContainers.exists(c, c.name in ['istio-init', 'istio-proxy']))
+      reason: Forbidden
+      messageExpression: >-
+        "this pod has an Istio sidecar injected, which an agent namespace does not run (mesh.mode {{ include "mesh.mode" . }}). " +
+        "The pod spec is probably innocent: check whether the namespace carries istio-injection=enabled, " +
+        "because Istio resolves a namespace labelled for both data planes in favour of sidecar and replaces " +
+        "per-node capture silently. Remove that label. See https://docs.aws.amazon.com/eks/latest/userguide/agents-mesh.html."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: eks-agents-sandbox-required
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  policyName: eks-agents-sandbox-required
+  validationActions: [{{ .Values.admission.validationAction | quote }}]
+
+  matchResources:
+    {{/*
+    Bound by namespace label, not to every namespace on the cluster. Binding cluster-wide would
+    refuse every kube-system pod and every platform component, none of which is an agent and
+    several of which legitimately use host networking. The label in 00-namespaces.yaml is what opts
+    a namespace in, so adding an agent namespace means adding the label -- and a namespace created
+    without it is not covered, which is the first thing to check when a pod that should have been
+    refused is admitted.
+    */}}
+    namespaceSelector:
+      matchLabels:
+        eks-agents/admission: enforce

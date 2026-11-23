@@ -1,0 +1,10 @@
+# Written by terraform/open-source from enable_langfuse. Do not edit by hand: the next apply
+# overwrites it. Read by the opentelemetry-collector Application in 50-observability.yaml.
+#
+# This committed copy is the Langfuse-off form, and it carries nothing account-specific.
+config:
+  service:
+    pipelines:
+      traces:
+        exporters:
+          - debug

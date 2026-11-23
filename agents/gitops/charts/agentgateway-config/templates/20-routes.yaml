@@ -1,0 +1,217 @@
+{{/*
+The routes: which path reaches which backend.
+
+  /llm/<agent>  that agent's model backend, signed as that agent
+  /mcp          the aggregated MCP endpoint
+  host          each third-party destination, matched on the route's hostnames
+
+Anything matching none of these falls through to the gateway's own authorization and the network
+policy's default deny. The route list is the complete list of destinations, so adding one is a
+reviewable diff here rather than a hostname appearing in an agent's own configuration.
+
+WHY THE MODEL PATH CARRIES THE AGENT'S NAME. Per-agent role assumption needs one backend per agent
+(see 10-backends.yaml), and an HTTPRoute matches on request attributes rather than on JWT claims — so
+the path is what selects the backend. The agent resource definition points each agent at its own
+path, and an agent that changes the URL to another agent's path is refused by the Gateway-wide
+authorization in 00-gateway.yaml, which binds the agent name in an /llm/<name> path to the caller's
+verified subject. Without that binding, one agent's own token could call another agent's route
+with the other agent's credential attached.
+
+ONE THING THAT DOES NOT WORK, worth knowing before trying it. Matching a third-party destination with
+a `:authority` header match is rejected by Gateway API:
+
+  spec.rules[].matches[].headers[].name in body should match
+  '^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$'
+
+Pseudo-headers are not valid header names in a HTTPRoute match. Use the route's `hostnames` field,
+which is what it is for — hence one HTTPRoute per third-party destination below.
+*/}}
+{{- if .Values.model.perAgentRoleAssumption }}
+{{/*
+Empty when the agent resource definition is on -- each agent composes its own /llm/<name> route
+alongside its backend. See the note in 10-backends.yaml.
+*/}}
+{{- range $name, $agent := .Values.agents }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: llm-{{ $name }}
+  namespace: {{ $.Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/agent: {{ $name }}
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $.Values.gateway.name }}
+      sectionName: egress
+
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /llm/{{ $name }}
+      # ONE backendRef, even when the platform configures model failover.
+      #
+      # Failover lives inside that backend as priority groups (see 10-backends.yaml), not as extra
+      # entries here. Several backendRefs on one rule is weighted load balancing in Gateway API: it
+      # splits traffic across the listed backends rather than ordering them, so listing a fallback
+      # here would route a share of normal traffic to the fallback model. The retry policy that makes
+      # failover invisible to the agent attaches to this route in 30-policies.yaml.
+      backendRefs:
+        - group: agentgateway.dev
+          kind: AgentgatewayBackend
+          name: bedrock-{{ $name }}
+          weight: 1
+{{- end }}
+{{- else }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: llm
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $.Values.gateway.name }}
+      sectionName: egress
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /llm
+      backendRefs:
+        - group: agentgateway.dev
+          kind: AgentgatewayBackend
+          name: bedrock
+          weight: 1
+{{- end }}
+{{- if .Values.mcpServers }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  # EVERY FIELD THE API SERVER DEFAULTS IS WRITTEN OUT (parentRefs group and kind, the backend's
+  # weight). This Application diffs client-side, and Argo CD knows no defaults for Gateway API
+  # kinds, so a route that leaves them out stays OutOfSync after every successful sync, and the
+  # bootstrap's wait never ends.
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $.Values.gateway.name }}
+      sectionName: egress
+  rules:
+    {{- if (((.Values.personAccess | default dict).tokenExchange | default dict).enabled) }}
+    # A call carrying a person's token goes to the backend that exchanges it with the agent's for
+    # one delegated token (person_access_delegated_token, 10-backends.yaml). Same path, so the agent
+    # changes nothing; a match with a header outranks the same path without one.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mcp
+          headers:
+            - type: RegularExpression
+              name: x-person-token
+              value: ".+"
+      backendRefs:
+        - group: agentgateway.dev
+          kind: AgentgatewayBackend
+          name: mcp-servers-person
+          weight: 1
+    {{- end }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mcp
+      backendRefs:
+        - group: agentgateway.dev
+          kind: AgentgatewayBackend
+          name: mcp-servers
+          weight: 1
+{{- end }}
+{{- range $name, $dest := .Values.destinations }}
+---
+{{/*
+{{ $name }}: one route per third-party destination, matched on hostname.
+
+With transparent capture (capture.enabled, for unsandboxed pods; a pod in a Nitro sandbox isn't
+captured) the caller addresses {{ $dest.host }} directly, so the gateway routes on where the request
+was aimed. Otherwise the agent sets the Host header itself and this matches the same way.
+*/}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $.Values.gateway.name }}-{{ $name }}
+  namespace: {{ $.Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/destination: {{ $name }}
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $.Values.gateway.name }}
+      sectionName: egress
+
+  hostnames:
+    - {{ $dest.host | quote }}
+
+  rules:
+    # `matches` WRITTEN OUT, as on the /mcp route above: the API server defaults a rule with none to
+    # PathPrefix /, Argo CD diffs client-side, and without it the route stays OutOfSync after every
+    # successful sync, so bootstrap-gitops.sh --sync never finishes.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - group: agentgateway.dev
+          kind: AgentgatewayBackend
+          name: {{ $name }}
+          weight: 1
+{{- end }}
+{{- if (.Values.evals | default dict).enabled }}
+---
+# The judge's route. /judge/<serviceAccount>, bound to that one subject by agent-inbound-auth.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: judge-{{ .Values.evals.serviceAccount }}
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/judge: {{ .Values.evals.serviceAccount }}
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ .Values.gateway.name }}
+      sectionName: egress
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /judge/{{ .Values.evals.serviceAccount }}
+      backendRefs:
+        - group: agentgateway.dev
+          kind: AgentgatewayBackend
+          name: bedrock-judge-{{ .Values.evals.serviceAccount }}
+          weight: 1
+{{- end }}
+

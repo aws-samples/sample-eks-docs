@@ -1,0 +1,112 @@
+{{- if and .Values.ingress.enabled (.Values.ingress.oidc | default dict).issuer }}
+{{/*
+EVERY RULE ON THE INGRESS AUTHENTICATES, enforced at admission rather than described in a README.
+
+The Agent resource composes a route that carries the filter, so an agent onboarded through the
+the reference sample is safe without this. This is for the route nobody composed: a hand-written HTTPRoute,
+an agent that needs path rewriting or traffic splitting, a route edited in place with `kubectl`.
+
+The specific failure it closes: the OIDC gate attaches PER RULE, through an ExtensionRef filter on
+each `rules[]` entry. A route with two rules and one filter serves the other rule
+unauthenticated -- the Gateway reports Accepted, the ListenerRuleConfiguration reports nothing at
+all, and the only way to see it is to make an unauthenticated request to that path. There is no
+status condition anywhere that says "this rule has no authentication on it".
+
+Bound only where an identity provider is configured. With ingress.oidc empty the chart renders
+the unauthenticated route on purpose -- a cluster whose callers were already authenticated
+somewhere in front -- and this policy would refuse the very object that chart just produced.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: eks-agents-ingress-authenticated
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  # Fail, not Ignore. Ignore admits the route when the policy cannot be evaluated, and an admitted
+  # route is a served route.
+  failurePolicy: Fail
+
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["gateway.networking.k8s.io"]
+        apiVersions: ["v1", "v1beta1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["httproutes"]
+
+  variables:
+    # Does this route attach to the ingress Gateway? A route on another Gateway -- an in-cluster
+    # AgentGateway, an Istio gateway, a mesh waypoint -- is governed by that gateway's own policy
+    # surface and is none of this policy's business.
+    - name: onIngress
+      expression: >-
+        has(object.spec.parentRefs) && object.spec.parentRefs.exists(p,
+          p.name == {{ .Values.ingress.gatewayName | quote }} &&
+          (!has(p.kind) || p.kind == 'Gateway'))
+
+    # Rules with no ExtensionRef filter naming a ListenerRuleConfiguration. A rule may carry other
+    # filters -- a header rewrite, a redirect -- so this looks for the one that matters rather than
+    # for any filter at all.
+    - name: ungatedRules
+      expression: >-
+        has(object.spec.rules) ? object.spec.rules.filter(r,
+          !(has(r.filters) && r.filters.exists(f,
+            f.type == 'ExtensionRef' && has(f.extensionRef) &&
+            f.extensionRef.kind == 'ListenerRuleConfiguration'))) : []
+
+  validations:
+    # WHAT THIS CANNOT CHECK, and it is worth stating because the gap is not obvious.
+    #
+    # A ValidatingAdmissionPolicy sees only the object under admission, so it can confirm that a
+    # rule REFERENCES a ListenerRuleConfiguration and not that the referenced object authenticates
+    # anything: a route whose filter names an LRC carrying only a `source-ip` condition is admitted
+    # by this policy and then serves the agent with no authentication at all.
+    #
+    # So this policy closes the common mistake -- a rule with no filter -- and the thing that
+    # actually proves the gate is a request: scripts/exercise.sh asserts a refusal that is
+    # identifiably the gate's. Read these objects to find a misconfiguration; never to conclude the
+    # ingress is closed.
+    - expression: "!variables.onIngress || size(variables.ungatedRules) == 0"
+      reason: Forbidden
+      messageExpression: >-
+        'this HTTPRoute attaches to the ingress Gateway and ' + string(size(variables.ungatedRules)) +
+        ' of its ' + string(size(object.spec.rules)) + ' rule(s) carry no authentication. ' +
+        'The OIDC gate attaches per rule, as an ExtensionRef filter naming a ' +
+        'ListenerRuleConfiguration, and a rule without one is served unauthenticated with nothing ' +
+        'reporting it. Add the filter to every rule, or attach this route to a Gateway that is not ' +
+        'ingress.'
+
+    # A route that claims a hostname the listener certificate does not cover is Accepted and then
+    # fails the handshake, which reads as DNS rather than as a certificate. Cheap to catch here.
+    - expression: >-
+        !variables.onIngress || !has(object.spec.hostnames) ||
+        object.spec.hostnames.all(h, h.endsWith({{ printf ".%s" .Values.ingress.domainName | quote }}) ||
+          h == {{ .Values.ingress.domainName | quote }})
+      reason: Invalid
+      messageExpression: >-
+        'this route claims a hostname outside {{ .Values.ingress.domainName }}, which the ' +
+        'listener certificate does not cover. The route would be Accepted and the TLS handshake ' +
+        'would then fail, which reads like a DNS fault.'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: eks-agents-ingress-authenticated
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  policyName: eks-agents-ingress-authenticated
+  validationActions: [{{ .Values.admission.validationAction | quote }}]
+
+  # Cluster-wide, unlike the sandbox policy, and deliberately: the policy only acts on routes that
+  # name the ingress Gateway, so the question "which namespaces" is already answered by the
+  # Gateway's own allowedRoutes. Binding by namespace label would leave a route in an unlabelled
+  # namespace unchecked while the Gateway still accepted it.
+  matchResources: {}
+{{- end }}

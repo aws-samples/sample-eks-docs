@@ -1,0 +1,79 @@
+# The Argo CD project the platform's Applications belong to.
+#
+# WHY THIS FILE EXISTS. Every Application in this repository names this project, so that what the
+# platform may install is stated in one reviewable object instead of inherited from whatever
+# `default` happens to be on the Argo CD you point at.
+#
+# The managed capability treats the cluster's `argocd` namespace as an "app namespace", and an
+# Application there is refused unless its project opts that namespace in via `sourceNamespaces`:
+#
+#   application 'x' in namespace 'argocd' is not permitted to use project 'default'
+#
+# The managed Argo CD reads AppProjects from the cluster, so a project that opts the namespace in
+# fixes it. Whether the capability's `default` project already carries
+# `sourceNamespaces: ["argocd"]` is not something to rely on, so the repository ships its own
+# project and names it everywhere.
+#
+# WHAT IT DOES NOT FIX. The destination cluster. The managed Argo CD has the in-cluster destination
+# registered and **disabled**, so every Application here names the destination `eks-agents`
+# instead, which the cluster Secret in cluster-secret.yaml registers.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: eks-agents
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    # Before any Application that names it.
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  description: Platform and agent Applications for the EKS agentic AI reference sample
+
+  # The namespaces an Application naming this project may live in. This is the line the managed
+  # Argo CD requires; a self-managed one does not need it.
+  sourceNamespaces:
+    - argocd
+
+  # WHAT GITOPS MAY INSTALL FROM. This platform's own repository first (Terraform fills it in from
+  # gitops_repo_url when it renders appproject.local.yaml), then every chart and manifest
+  # repository a platform Application reads, spelled exactly as its `repoURL` spells it, so Argo CD
+  # refuses an Application that names any other. A component added to gitops/platform/open-source/templates
+  # with a repository not listed here fails scripts/validate.sh (scripts/lib/check_appproject.py) rather
+  # than failing its first sync. Repositories a team adds, such as its own repository of Agent
+  # manifests, come from argocd_extra_source_repos and land at the end.
+  sourceRepos:
+    - REPO_URL
+    - https://blob.istio.io/istio-release/charts                    # Istio: base, istiod, istio-cni, ztunnel
+    - https://github.com/kubernetes-sigs/gateway-api.git            # the Gateway API CRDs
+    - cr.agentgateway.dev/charts                                    # agentgateway and its CRDs (OCI)
+    - https://github.com/kubernetes-sigs/agent-sandbox.git          # the agent-sandbox controller and CRDs
+    - https://kubernetes-sigs.github.io/external-dns/               # external-dns
+    - https://kedacore.github.io/charts                             # KEDA
+    - https://aws.github.io/secrets-store-csi-driver-provider-aws   # the Secrets Store CSI driver's AWS provider
+    - https://open-telemetry.github.io/opentelemetry-helm-charts    # the OpenTelemetry Collector and operator
+    - https://prometheus-community.github.io/helm-charts            # Prometheus and Grafana
+    - https://charts.jetstack.io                                    # cert-manager
+    - https://langfuse.github.io/langfuse-k8s                       # Langfuse
+    - ghcr.io/clickhouse                                            # the ClickHouse operator (OCI)
+    - registry-1.docker.io/bitnamicharts                            # Valkey (OCI)
+    - https://cloudnative-pg.github.io/charts                       # CloudNativePG and its cluster chart
+    # EXTRA_SOURCE_REPOS
+
+  # WHERE IT MAY INSTALL. Only the cluster the platform registers (cluster-secret.yaml), which every
+  # Application names as its destination; any namespace in it, because the platform's components
+  # each own one.
+  destinations:
+    - name: eks-agents
+      namespace: "*"
+
+  # THE ONE WIDE ENTRY. The platform installs cluster-scoped kinds as part of what it is: CRDs,
+  # ClusterRoles and their bindings, admission webhook configurations, ClusterNetworkPolicies and
+  # ValidatingAdmissionPolicies. Listing them kind by kind would have to change with every chart
+  # upgrade that adds one, and a missing kind fails a sync partway through. The narrowing that
+  # matters is above: what this cluster may install from, and into which cluster.
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"

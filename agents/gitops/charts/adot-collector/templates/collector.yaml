@@ -1,0 +1,217 @@
+{{- if eq .Values.region "REGION_NOT_SET" }}
+{{ fail "region is still the placeholder. The CloudWatch and X-Ray exporters name the Region; a placeholder produces a collector that buffers telemetry and drops it. Pass the terraform-values.yaml file aws-services Terraform wrote as a second values file." }}
+{{- end }}
+{{- if not .Values.observability.telemetryLogGroup }}
+{{ fail "observability.telemetryLogGroup is required: the awsemf and awscloudwatchlogs exporters write to it, and the collector's IAM role permits that group alone. An empty value means every export is denied." }}
+{{- end }}
+{{- /* Content stays on spans when the chart value says so, or when an evaluation grades the spans. */}}
+{{- $keepContent := or .Values.collector.keepPromptContent .Values.observability.evaluationsReadSpans }}
+---
+# The service account the Pod Identity association delivers the collector's role to. Its name has to
+# match collector_service_account in terraform/modules/observability-aws, or the association
+# delivers credentials to a service account nothing uses and every export fails with no credentials
+# found — on a collector that looks healthy.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.observability.collectorServiceAccount }}
+  namespace: {{ .Values.observability.collectorNamespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+---
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: adot
+  namespace: {{ .Values.observability.collectorNamespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  # The ADOT distro, not upstream contrib. This is the image whose exporters write in the shape the
+  # GenAI Observability views read; an upstream collector emits the same spans and they do not land
+  # where the views look.
+  image: public.ecr.aws/aws-observability/aws-otel-collector:v0.44.0
+
+  # A deployment, not a daemonset or a sidecar. The agent's spans are application telemetry reaching
+  # an addressable endpoint; a sidecar per agent would also put a second container inside each
+  # sandbox, which is a boundary the telemetry has no reason to cross.
+  mode: deployment
+  replicas: {{ .Values.collector.replicas }}
+
+  serviceAccount: {{ .Values.observability.collectorServiceAccount }}
+
+  resources:
+    {{- toYaml .Values.collector.resources | nindent 4 }}
+
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      # Batch before export. An agent emitting a span per tool call produces a high request rate at
+      # low volume, which is the pattern batching exists for, and CloudWatch bills per request.
+      batch:
+        timeout: 10s
+        send_batch_size: 1024
+
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+
+      # Stamp the cluster onto every span and metric, so telemetry from two clusters in one account
+      # is separable without reading the resource attributes the agent happened to set.
+      resource:
+        attributes:
+          - key: aws.eks.cluster.name
+            value: {{ .Values.cluster | quote }}
+            action: upsert
+          - key: cloud.platform
+            value: aws_eks
+            action: upsert
+
+      {{- if not $keepContent }}
+      # Drop the attributes carrying prompt and completion content before export. The trajectory
+      # view keeps the shape of each step and loses what was said.
+      attributes/strip_content:
+        actions:
+          - key: gen_ai.prompt
+            action: delete
+          - key: gen_ai.completion
+            action: delete
+          - key: gen_ai.request.messages
+            action: delete
+          - key: gen_ai.response.messages
+            action: delete
+      {{- end }}
+
+    extensions:
+      # SigV4 for the OTLP exporter below, signed as the collector's Pod Identity role.
+      sigv4auth:
+        region: {{ .Values.region | quote }}
+        service: xray
+
+    exporters:
+      # SPANS GO TO X-RAY'S OTLP ENDPOINT, NOT THROUGH awsxray. The awsxray exporter converts each
+      # span to an X-Ray segment document, which has no place for span EVENTS -- and Strands puts the
+      # conversation there (gen_ai.user.message, gen_ai.choice, gen_ai.system.message). Through
+      # awsxray the spans that reach aws/spans carry none of those events, and AgentCore online
+      # evaluation has no transcript to grade. The OTLP endpoint writes the span as sent. awsxray is
+      # kept below for reference and wired to no pipeline.
+      otlphttp/xray:
+        traces_endpoint: {{ printf "https://xray.%s.amazonaws.com/v1/traces" .Values.region | quote }}
+        auth:
+          authenticator: sigv4auth
+
+      # NOT IN ANY PIPELINE (see otlphttp/xray above); kept for reference. Spans to X-Ray. With
+      # Transaction Search enabled these become searchable transactions rather
+      # than sampled traces, which is what the per-invocation token counts and tool-call outcomes in
+      # the GenAI Observability views are read from. Without Transaction Search the spans still
+      # arrive and the views are thin — verify it rather than assume it:
+      #   aws xray get-trace-segment-destination --region {{ .Values.region }}
+      awsxray:
+        region: {{ .Values.region | quote }}
+        # SPAN attributes only. `indexed_attributes` indexes span attributes, and an entry for
+        # something that is not one indexes nothing and reports nothing.
+        #
+        # NO eks.agent ENTRY. The agent resource definition sets it through
+        # OTEL_RESOURCE_ATTRIBUTES, which makes it a RESOURCE attribute, so an entry for it here
+        # indexes nothing: traces arrive indexed by gen_ai.system, gen_ai.request.model,
+        # aws.local.service and span.kind, and an eks.agent entry produces no index at all.
+        #
+        # Copying it onto spans needs the `transform` processor, and the ADOT distro does not ship
+        # one -- the collector refuses to start with `'processors' unknown type: "transform"`, which
+        # is worth knowing before reaching for any upstream-contrib processor here. The available
+        # set is batch, memory_limiter, probabilistic_sampler, span, k8sattributes, attributes,
+        # resource, tail_sampling, filter, metricstransform, resourcedetection, metricsgeneration,
+        # deltatorate, groupbytrace and cumulativetodelta.
+        #
+        # No loss in practice: the exporter already annotates aws.local.service from
+        # OTEL_SERVICE_NAME, which the resource definition sets to the agent's name. So the agent IS
+        # queryable in X-Ray -- under aws.local.service rather than under this stack's own name.
+        indexed_attributes:
+          - gen_ai.system
+          - gen_ai.request.model
+
+      # GenAI metrics as EMF. The namespace has to be one the collector's IAM role permits; a
+      # namespace outside that list is AccessDenied on every publish.
+      awsemf:
+        region: {{ .Values.region | quote }}
+        namespace: {{ .Values.collector.metricNamespace | quote }}
+        log_group_name: {{ .Values.observability.telemetryLogGroup | quote }}
+        dimension_rollup_option: NoDimensionRollup
+
+        # WITHOUT THIS, eks.agent IS NOT AVAILABLE AS A DIMENSION. The exporter builds dimensions
+        # from a datapoint's own attributes, and eks.agent arrives as a RESOURCE attribute, so the
+        # per-agent dimension set below would select nothing and silently produce no series --
+        # the same class of quiet miss as the X-Ray entry above.
+        resource_to_telemetry_conversion:
+          enabled: true
+
+        # WHICH DIMENSIONS A METRIC IS PUBLISHED WITH, and this is a bill as much as a dashboard.
+        #
+        # Without metric_declarations the exporter turns EVERY attribute into a dimension. The
+        # Strands SDK tags its event-loop metrics with `event_loop_cycle_id`, which is unique per
+        # agent turn, so each turn publishes NEW CloudWatch custom metrics that nothing would ever
+        # write to again. CloudWatch bills per custom metric, so that is unbounded spend growing
+        # with traffic, and the metrics are useless individually.
+        #
+        # It also leaves the dashboard empty. With NoDimensionRollup and a unique dimension on every
+        # datapoint there is no aggregate series, and the dashboard queries the metric names with no
+        # dimensions -- so the panels have nothing to read while metrics are arriving, every one of
+        # them dimensioned by a cycle id.
+        #
+        # An aggregate series, one per cluster, and ONE PER AGENT.
+        #
+        # The per-agent dimension works because the agent resource definition already sets
+        # `eks.agent` on every agent through OTEL_RESOURCE_ATTRIBUTES, alongside
+        # k8s.namespace.name and k8s.deployment.name. Leaving the dimension out is what makes
+        # metrics arrive with no way to tell one agent from another.
+        #
+        # Three dimension sets, not one: the empty set is the aggregate the dashboard panels query,
+        # and the other two are the cuts worth having. Each set multiplies the metric count, so this
+        # is a cost decision as much as a reporting one -- a set with unbounded values is the
+        # `event_loop_cycle_id` problem above.
+        metric_declarations:
+          - dimensions:
+              - []
+              - [aws.eks.cluster.name]
+              - [eks.agent]
+            metric_name_selectors:
+              - ".*"
+
+      awscloudwatchlogs:
+        region: {{ .Values.region | quote }}
+        log_group_name: {{ .Values.observability.telemetryLogGroup | quote }}
+        log_stream_name: agents
+
+    service:
+      extensions: [sigv4auth]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, {{ if not $keepContent }}attributes/strip_content, {{ end }}batch]
+          exporters: [otlphttp/xray]
+
+        metrics:
+          receivers: [otlp]
+          # No processor strips content here. The GenAI instrumentation the agents run puts prompts
+          # and completions on spans and log records, not on metric datapoints, and
+          # metric_declarations above publishes only its three dimension sets, so no attribute
+          # becomes a dimension. A datapoint's other attributes do still reach the EMF record in the
+          # telemetry log group; a team whose own metrics carry content adds
+          # attributes/strip_content to this pipeline.
+          processors: [memory_limiter, resource, batch]
+          exporters: [awsemf]
+
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, {{ if not $keepContent }}attributes/strip_content, {{ end }}batch]
+          exporters: [awscloudwatchlogs]

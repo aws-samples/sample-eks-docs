@@ -1,0 +1,71 @@
+{{- if not (has "52-agent-evals.yaml" .Values.excluded) }}
+# Agent evaluation on the AWS services path: Strands Evals test cases, run on demand against deployed
+# agents, with results written to AgentCore Evaluations' result log group so they appear in the
+# CloudWatch GenAI Observability dashboard beside the managed online evaluation's.
+#
+# SYNCED ONLY WITH enable_evaluations = true. The platform chart's excluded list leaves this file out
+# otherwise. The same variable creates the runner's Pod Identity role in
+# terraform/modules/evaluations-aws: read the agents' telemetry log group and aws/spans, write
+# /aws/bedrock-agentcore/evaluations/results/*, and nothing else.
+#
+# NO ONLINE CRONJOB HERE. AgentCore Evaluations' online config (enable_online_evaluation) already
+# grades live traffic on this path; the chart renders the online CronJob for the langfuse backend
+# only. What Strands Evals adds is the release gate: declared cases with expected answers, run
+# against the deployed candidate before it takes traffic.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agent-evals
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    # After the base chart, which creates the runner's namespace and admits it on each agent's
+    # network policy, and after the trace backend it reads.
+    argocd.argoproj.io/sync-wave: "4"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: {{ .Values.repo.url }}
+    targetRevision: {{ .Values.repo.revision }}
+    path: {{ .Values.repo.path }}gitops/charts/agent-evals
+
+    helm:
+      valueFiles:
+        - values.yaml
+        # What the platform team declares: the release gate's cases, the runner image tag, and any
+        # override of the chart's defaults. Last, so it wins.
+      # ignoreMissingValueFiles stays at its default, false, so a missing values file fails the
+      # render. Not written out: the EKS Argo CD capability rewrites Application objects and drops
+      # a false field, so an Application that sets it compares Git's false with nothing and stays
+      # OutOfSync.
+      # The rendered values (terraform, agentEvals), passed by the root Application.
+      values: |
+        {{- toYaml (mergeOverwrite (deepCopy .Values.terraform) (deepCopy .Values.agentEvals)) | nindent 8 }}
+  destination:
+    name: eks-agents
+    namespace: agent-evals
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # LONGER THAN THE SHORT BACKOFF every other Application carries (5 s, x2, cap 30 s), on purpose:
+    # its namespace comes from eks-agents-base (00-namespaces.yaml) and a sync wave
+    # does not wait for another Application to be healthy. On a fresh cluster the base chart can
+    # sync many minutes after Istio; this Application's first sync then fails with `namespaces
+    # "agent-evals" not found`, and Argo CD does not re-run a failed sync of the same revision on
+    # its own -- it stays failed until synced by hand. ~40 minutes of backoff.
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+    syncOptions:
+      - ServerSideApply=true
+{{- end }}

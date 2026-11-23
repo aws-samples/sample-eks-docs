@@ -1,0 +1,62 @@
+{{- if not (has "54-istio-namespace.yaml" .Values.excluded) }}
+# The namespace the mesh installs into, created by its own Application ahead of the mesh's
+# Applications, rather than by them.
+#
+# WHY THIS FILE EXISTS. The Istio Applications carry `syncOptions: [CreateNamespace=true]`, and on a
+# cold start none of them creates it. Each then fails with
+#
+#   one or more objects failed to apply, reason: namespaces "istio-system" not found
+#
+# and reports `Synced`/`Healthy` on the subset of cluster-scoped objects that do apply -- the CRDs,
+# the ClusterRoles, the webhook configurations -- so most of the Applications READ AS HEALTHY WITH NO
+# MESH RUNNING AT ALL, while the agent namespace already carries `istio.io/dataplane-mode: ambient`
+# (the combination the header of 55-istio.yaml warns about). They do not recover on their own --
+# `selfHeal` retries drift, not an exhausted failed operation.
+#
+# This Application syncs at wave -14, before istio-base (-13) and the rest of the mesh, so the
+# namespace is there for their first attempt. The platform chart renders it only when mesh_mode is
+# not "none" (its excluded list, Terraform's platform_excluded), like the Istio Applications.
+# `kubectl get ns istio-system` is not evidence the mesh is installed;
+# `kubectl -n istio-system get ds ztunnel` is.
+#
+# NOT A NAMESPACE IN THE ROOT. A cluster-scoped Namespace applied by the root Application itself is
+# tracked under the root's destination namespace and never reads Synced, so the Namespace is owned by
+# a child Application, as the Namespaces the base chart owns are, and the root renders only
+# Applications.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: istio-namespace
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "-14"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+  source:
+    repoURL: {{ .Values.repo.url }}
+    targetRevision: {{ .Values.repo.revision }}
+    path: {{ .Values.repo.path }}gitops/platform/aws-services/istio-namespace
+  destination:
+    name: eks-agents
+    namespace: kube-system
+  syncPolicy:
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      # Never prune the namespace out from under a running mesh; removing the Application (mesh_mode
+      # = "none", or the teardown) still deletes it through the finalizer.
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true
+{{- end }}

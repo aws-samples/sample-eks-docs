@@ -1,0 +1,178 @@
+{{- if and .Values.networkPolicy.enabled .Values.networkPolicy.namespaced }}
+{{/*
+The same egress boundary in the shape the EKS User Guide documents: a namespaced
+ApplicationNetworkPolicy.
+
+Rendered by default even when the cluster-scoped policy is also on, because two layers that each
+refuse on their own is the posture this stack is built for: neither depends on the other being
+configured correctly. It becomes the only boundary when networkPolicy.clusterScoped is false, for
+example on a cluster whose ClusterNetworkPolicy CRD does not match the schema the cluster-scoped
+template is written against.
+
+What it costs as a sole boundary. This object lives in the agent's own namespace, so anyone holding
+RBAC to edit network policies there can replace it. If it is the boundary rather than a second
+layer, the RBAC on it is part of the boundary: nobody who can deploy an agent should be able to edit
+it.
+
+The field names here are from the EKS User Guide's own worked example -- podSelector, policyTypes,
+egress, to, ipBlock, domainNames, ports -- so this file needs no schema verification. It still needs
+enforcement verification, because every network policy on a cluster without the ConfigMap in
+10-network-policy-controller.yaml is accepted and ignored.
+
+https://docs.aws.amazon.com/eks/latest/userguide/auto-net-pol.html
+*/}}
+---
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ApplicationNetworkPolicy
+metadata:
+  name: eks-agents-reasoning-egress
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  namespace: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  {{/*
+  Every pod in the namespace, not a label subset. A policy selecting `app: something` leaves the pod
+  whose author forgot the label with no policy at all, and on this API no policy means no
+  restriction.
+  */}}
+  podSelector: {}
+
+  {{/*
+  Both types named. Listing only Egress would leave ingress unrestricted, which is not what a reader
+  of a file called "egress" expects but is what the API does.
+  */}}
+  policyTypes:
+    - Ingress
+    - Egress
+
+  egress:
+    # DNS. Port 53 to the resolver ranges rather than to one looked-up address, because the
+    # resolver a pod uses is not in the same place on every cluster (see the DNS rule in
+    # 30-cluster-egress-policy.yaml), and rather than 0.0.0.0/0: see networkPolicy.dnsDestinations.
+    - to:
+        {{- range .Values.networkPolicy.dnsDestinations }}
+        - ipBlock: { cidr: {{ . | quote }} }
+        {{- end }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+
+    # EKS Pod Identity credentials.
+    - to:
+        - ipBlock: { cidr: 169.254.170.23/32 }
+      ports:
+        - { protocol: TCP, port: 80 }
+
+    {{/*
+    THE IN-CLUSTER DESTINATIONS, RENDERED HERE TOO, FROM ONE LIST.
+
+    `networkPolicy.inClusterDestinations` drives this policy and
+    30-cluster-egress-policy.yaml from the same place, so adding a destination once puts it in both
+    tiers and the two cannot disagree.
+
+    The tiers are not peers, and it matters for reading a failure here. An Admin-tier `Accept` ENDS
+    EVALUATION, exactly as 30-cluster-egress-policy.yaml says, so a destination the cluster policy
+    names is reachable whether or not this policy mentions it. This tier narrows what the Admin tier
+    leaves unnamed; it has no veto over what the Admin tier accepted. A destination the Admin tier
+    accepts -- the collector, the checkpoint bucket, STS -- is reachable even where no
+    ApplicationNetworkPolicy names it; only a destination named at NO tier is refused.
+
+    So when a destination times out, the cluster policy is not where the answer is. The symptom is a
+    bare socket timeout against a name that resolves:
+
+      TimeoutError: timed out
+        socket.create_connection(('agent-session-state-valkey-primary.agent-memory...', 6379))
+
+    and the usual cause is a destination NAME that matches nothing -- a Service called
+    `session-state` where the release actually creates `agent-session-state-valkey-primary` -- not a
+    tier disagreeing with another tier.
+
+    ONE CAVEAT ON THE PORTS. These are the application's ports, which is correct while the
+    destination namespace is NOT enrolled in the mesh -- `agent-memory` is not, so valkey and
+    pgvector are reached as plain TCP. If you enrol a destination namespace in ambient, its pods
+    stop accepting connections on the application port and start accepting them on HBONE 15008
+    instead, and a rule naming only the application port silently matches nothing. See the
+    agents-mesh page of the EKS User Guide, and gitops/examples/mcp-server for what that failure
+    looks like.
+    */}}
+    {{- range .Values.networkPolicy.inClusterDestinations }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace }}
+      {{- if .ports }}
+      ports:
+        {{- range .ports }}
+        - { protocol: TCP, port: {{ . }} }
+        {{- end }}
+      {{- end }}
+    {{- end }}
+
+    {{- if not .Values.gateway.enabled }}
+    # No gateway: Amazon Bedrock's data plane, reached with the agent's own credential -- the same
+    # destination the cluster tier accepts in place of the gateway.
+    - to:
+        - domainNames:
+            - {{ printf "bedrock-runtime.%s.%s" .Values.region (ternary "amazonaws.com.cn" "amazonaws.com" (eq .Values.partition "aws-cn")) | quote }}
+      ports:
+        - { protocol: TCP, port: 443 }
+    {{- else if eq .Values.path "open-source" }}
+    # AgentGateway, in the cluster.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.gateway.namespace }}
+    {{- else }}
+    {{- if not .Values.gateway.hostname }}
+    {{ fail "gateway.hostname is required on the aws-services path: it is the single destination this policy allows, and without it the rendered policy would permit nothing and every agent would fail at its first call. Take the value from the gateway_hostname Terraform output." }}
+    {{- end }}
+    # AgentCore Gateway, by hostname. This is the one destination an agent may reach: the rule
+    # resolves by name rather than by address, and the eBPF enforcement follows the resolved IPs
+    # with their TTL, so a change of address behind the name does not open a hole or close one.
+    - to:
+        - domainNames:
+            - {{ .Values.gateway.hostname | quote }}
+      ports:
+        - { protocol: TCP, port: 443 }
+    {{- end }}
+
+  ingress:
+    {{/*
+    Calls from inside the namespace, such as the chat UI's. Everything else reaching an agent
+    arrives through the load balancer, which is a separate path; see the agents-ingress page of the
+    EKS User Guide.
+    */}}
+    - from:
+        - podSelector: {}
+---
+{{/*
+The execution tier: nothing, in either direction.
+
+These pods boot with no network device, so this policy is redundant by construction -- and that is
+why it is here. It is the rule that still holds the moment somebody drops the
+sandbox.amazonaws.com/network-isolated annotation from a pod template, which is a one-line change in
+a manifest that nothing else would catch. Without it, such a pod comes up with a working interface
+and no policy, which on this API means no restriction.
+*/}}
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ApplicationNetworkPolicy
+metadata:
+  name: eks-agents-execution-no-network
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  namespace: {{ .Values.namespaces.execution }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  podSelector: {}
+
+  # Both types named, with no rules under either. On this API that is deny-all, and it is the
+  # intended configuration rather than an unfinished file.
+  policyTypes:
+    - Ingress
+    - Egress
+{{- end }}

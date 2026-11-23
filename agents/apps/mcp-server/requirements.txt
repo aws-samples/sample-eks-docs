@@ -1,0 +1,14 @@
+# Pinned, not ranged: an image's dependency set is part of what the image scan and the sandbox policy
+# were evaluated against, so a rebuild that picks up a new minor version changes what was reviewed.
+# See ../../VERSIONS.md.
+
+fastapi==0.165.0
+# fastapi 0.165 needs starlette 1.6 or newer; pinned so the image is the one that was scanned.
+starlette==1.10.0
+uvicorn==0.38.0
+httpx==0.28.1
+
+# The credential check. PyJWT with the crypto extra, because verifying a signature needs a backend:
+# the cluster's tokens are RS256 and the ALB signs with ES256, and the bare package can decode
+# neither. A decoder without a verifier is what turns a gate into a header check.
+pyjwt[crypto]==2.15.1
