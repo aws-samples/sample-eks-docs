@@ -1,0 +1,369 @@
+{{/*
+The backends: what sits behind the gateway.
+
+  spec.ai      the model
+  spec.mcp     an aggregated MCP endpoint
+  spec.static  a third-party REST service, with the credential attached under policies.auth
+
+ONE MODEL BACKEND PER AGENT, and the reason is worth reading.
+
+This stack has the gateway assume the calling agent's own IAM role and sign the model
+call on it, so the call is scoped by that agent's policy rather than by a gateway-wide allowance.
+That requires `policies.auth.aws.assumeRole.roleArn`, and the CRD constrains it to a literal ARN:
+
+  spec.policies.auth.aws.assumeRole.roleArn in body should match
+  '^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$'
+
+So it cannot be a CEL expression over the verified caller, and one backend cannot serve every agent
+by deriving the role per request. The role is fixed per backend, which means one backend per agent.
+
+That is more objects, and it is the better shape anyway: each agent's model access is a reviewable
+object naming one role and one model, and the route that reaches it is per agent too. The agent
+resource definition points each agent at its own path, and an agent cannot reach another agent's
+backend by changing a URL because the Gateway-wide authorization in 00-gateway.yaml binds each
+/llm/<name> path to that agent's subject.
+
+A team that does not need per-agent attribution sets model.perAgentRoleAssumption to false and gets
+one shared backend on the gateway's own role.
+*/}}
+{{- if .Values.model.perAgentRoleAssumption }}
+{{- if and (not .Values.agents) (not .Values.agentResource.enabled) }}
+{{ fail "model.perAgentRoleAssumption is true, no agents are declared, and the agent resource definition is off -- so nothing would render a model backend and the gateway would have none at all. Either declare the agents here, or set agentResource.enabled so each agent composes its own backend, or set perAgentRoleAssumption to false for one shared backend on the gateway's own role." }}
+{{- end }}
+
+{{/*
+AN EMPTY AGENT LIST IS CORRECT WHEN THE AGENT RESOURCE DEFINITION IS ON, so this guard accepts it.
+`agentResource.enabled` is derived in Terraform as `length(var.agents) == 0`, so the agents map
+this chart ranges over is empty exactly when that definition is active. A guard that rejects an
+empty list makes the two mutually exclusive: declaring agents disables the `Agent` CRD, and not
+declaring them fails this render.
+
+The resolution is that per-agent gateway configuration belongs with the agent, not here. A Helm
+chart cannot render a backend for an `Agent` that arrives after render time, so on that path
+gitops/base/templates/40-agent-rgd.yaml composes each agent's backend and route. This chart still
+renders them when the platform team declares agents in Terraform, which is the other supported
+shape.
+*/}}
+{{- if not .Values.accountId }}
+{{ fail "accountId is required when model.perAgentRoleAssumption is true: each agent's role ARN is built from it, and the CRD requires a literal ARN rather than an expression." }}
+{{- end }}
+{{- range $name, $agent := .Values.agents }}
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-{{ $name }}
+  namespace: {{ $.Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/agent: {{ $name }}
+spec:
+  ai:
+{{- if $.Values.model.fallbackModelIds }}
+{{- if gt (len $.Values.model.fallbackModelIds) 7 }}
+{{ fail (printf "model.fallbackModelIds has %d entries. The CRD caps ai.groups at 8 and the primary model takes one, so at most 7 fallbacks are expressible." (len $.Values.model.fallbackModelIds)) }}
+{{- end }}
+    # FAILOVER IS PRIORITY GROUPS INSIDE ONE BACKEND, not several backends on the route.
+    #
+    # `ai.groups` is a list in priority order; the gateway tries the first group and moves down only
+    # when a provider is EVICTED, which is what gitops/charts/agentgateway-config/templates/30-policies.yaml
+    # supplies. Groups alone never fail over, because nothing evicts. The CRD makes `provider` and
+    # `groups` mutually exclusive, so a backend with fallbacks has no `provider` key at all.
+    #
+    # NOT extra `backendRefs` entries on the route: that is weighted load balancing in Gateway API
+    # -- several backendRefs split traffic rather than ordering it -- so it would send a share of
+    # every agent's calls to the fallback model in steady state.
+    #
+    # Provider names must be unique across every group, and policies can target one by name through
+    # `targetRefs[].sectionName`. The credential is NOT per provider here: `policies.auth` below sits
+    # at the backend level and is inherited by all of them, so failover never changes which agent the
+    # call is signed as.
+    groups:
+      - providers:
+          - name: primary
+            bedrock:
+              model: {{ $.Values.model.bedrockModelId | quote }}
+              region: {{ $.Values.region | quote }}
+      {{- range $i, $modelId := $.Values.model.fallbackModelIds }}
+      - providers:
+          - name: fallback-{{ $i }}
+            bedrock:
+              model: {{ $modelId | quote }}
+              region: {{ $.Values.region | quote }}
+      {{- end }}
+{{- else }}
+    provider:
+      bedrock:
+        model: {{ $.Values.model.bedrockModelId | quote }}
+        region: {{ $.Values.region | quote }}
+{{- end }}
+
+  policies:
+    auth:
+      aws:
+        region: {{ $.Values.region | quote }}
+        serviceName: bedrock
+
+        # {{ $name }}'s own role. The gateway holds nothing but permission to assume this set of
+        # roles, so what it may do as this agent is this agent's own permission policy: the model
+        # ARNs it names and the guardrail it requires.
+        #
+        # sessionName puts the agent's identity into the role session, which is what makes
+        # CloudTrail show which agent made the call. Without it every agent's calls share one
+        # session name and the attribution this arrangement exists for is lost.
+        assumeRole:
+          roleArn: arn:{{ $.Values.partition | default "aws" }}:iam::{{ $.Values.accountId }}:role{{ $.Values.agentResource.rolePath | default "/eks-agents/" }}{{ $.Values.cluster }}-agent-{{ $name }}
+          sessionName: {{ $name | quote }}
+          {{- if $.Values.model.sessionTags.enabled }}
+          # Session tags, which are what reaches the bill. sessionName above is enough for
+          # CloudTrail and is not enough for cost: the Cost and Usage Report splits spend on
+          # activated cost allocation tags, not on a role session name. Two preconditions outside
+          # this chart -- sts:TagSession in the role's trust policy, which
+          # terraform/modules/agent-identity grants alongside sts:AssumeRole, and activating these
+          # keys as cost allocation tags in the Billing console, which is a console action in the
+          # payer account and cannot be done from Terraform. Until that activation the tags are on
+          # the session and absent from the report. A list-map keyed on `key`, capped at 50 by STS.
+          tags:
+            - key: {{ $.Values.model.sessionTags.agentKey | quote }}
+              value: {{ $name | quote }}
+            - key: {{ $.Values.model.sessionTags.clusterKey | quote }}
+              value: {{ $.Values.cluster | quote }}
+            {{- range $key, $value := $.Values.model.sessionTags.extra }}
+            - key: {{ $key | quote }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- end }}
+          {{- if $.Values.model.externalId }}
+          # Matches the external-ID condition terraform/modules/agent-identity writes into this
+          # agent role's trust policy, so a routing mistake cannot become an authorization mistake.
+          externalId: {{ $.Values.model.externalId | quote }}
+          {{- end }}
+
+    {{- if $.Values.promptGuard.enabled }}
+    ai:
+      promptGuard:
+        {{- include "agentgateway-config.promptGuard" $ | nindent 8 }}
+    {{- end }}
+{{- end }}
+{{- else }}
+---
+{{/*
+One shared model backend, signed as the gateway itself.
+
+What this gives up: per-agent model scope and per-agent attribution. Every agent's model call is
+authorized by the gateway's own role and appears in CloudTrail as the gateway. Correct only where one
+model allowance covers every agent on the cluster.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  ai:
+    provider:
+      bedrock:
+        model: {{ .Values.model.bedrockModelId | quote }}
+        region: {{ .Values.region | quote }}
+  policies:
+    auth:
+      aws:
+        region: {{ .Values.region | quote }}
+        serviceName: bedrock
+    {{- if .Values.promptGuard.enabled }}
+    ai:
+      promptGuard:
+        {{- include "agentgateway-config.promptGuard" . | nindent 8 }}
+    {{- end }}
+{{- end }}
+{{- if .Values.mcpServers }}
+---
+{{/*
+One MCP backend aggregating every server, rather than one per server, so an agent reaches a single
+/mcp path instead of carrying a connection per server.
+
+sessionAffinity is what handles MCP session routing without the platform team doing anything: the
+gateway routes on the session identifier the server returned, so a request never lands on a replica
+that has never seen that session. A load balancer alone cannot do this, because an MCP client is not
+a browser and need not carry a cookie.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: mcp-servers
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+{{- include "agentgateway-config.mcpTargets" . }}
+
+  policies:
+    sessionAffinity:
+      source: mcp
+{{- $te := ((.Values.personAccess | default dict).tokenExchange | default dict) }}
+{{- if $te.enabled }}
+{{- range $k := list "tokenUrl" "clientId" "secretName" "audience" "actorProvider" }}
+{{- if not (index $te $k) }}
+{{ fail (printf "personAccess.tokenExchange.enabled is true and personAccess.tokenExchange.%s is empty. Terraform writes it with person_access_delegated_token; without it the exchange is refused and every MCP call carrying a person's token fails." $k) }}
+{{- end }}
+{{- end }}
+---
+{{/*
+THE SAME MCP SERVERS, FOR A CALL THAT CARRIES A PERSON'S TOKEN (person_access_delegated_token).
+
+The /mcp route sends a request with x-person-token here (20-routes.yaml), and every other request to
+mcp-servers above. Two backends because the exchange is all or nothing: a request this backend gets
+with no person token is refused (the subject token is required), so one that has none must never
+arrive here.
+
+WHAT THE EXCHANGE DOES (RFC 8693 delegation, at the user pool's token endpoint):
+
+  subject  the person's access token, from x-person-token
+  actor    the token the agent presented to this gateway, which jwtAuthentication verified. The
+           gateway strips that header once it has verified it, so the actor is read from the
+           verified claims' raw token rather than from a header that is gone by then.
+  result   one access token signed by the pool: sub is the person, aud is the tools, act.sub is
+           the agent. Written to Authorization on the request to the tool. x-person-token is
+           removed, so the person's own token never reaches the tool.
+
+The response is cached per (subject, actor) pair, so a second call from the same agent for the same
+person makes no token request.
+
+The agents that may act for a person are still decided here by mcp-tool-policy (30-policies.yaml):
+Cognito verifies the actor token but does not restrict which workload it names. The tool checks
+act.sub as well.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: mcp-servers-person
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+{{- include "agentgateway-config.mcpTargets" . }}
+
+  policies:
+    sessionAffinity:
+      source: mcp
+    auth:
+      oauthTokenExchange:
+        grantType: TokenExchange
+        url: {{ $te.tokenUrl | quote }}
+        clientAuth:
+          clientId: {{ $te.clientId | quote }}
+          method: ClientSecretBasic
+          secretRef:
+            name: {{ $te.secretName | quote }}
+            key: {{ $te.secretKey | default "clientSecret" | quote }}
+        subjectToken:
+          source:
+            header:
+              name: x-person-token
+          tokenType: AccessToken
+        actorToken:
+          source:
+            expression: jwt.rawToken.unredacted()
+          # Cognito's name for a token its external provider issued.
+          tokenType: urn:ietf:params:oauth:token-type:id_token
+        # The tools, as the pool's resource server: the token's aud. NO scope: the pool refuses a
+        # delegation request that names one (invalid_request).
+        audiences:
+          - {{ $te.audience | quote }}
+        additionalParams:
+          # Which provider signed the actor token: the cluster's issuer, as the pool knows it.
+          actor_token_provider_name: {{ printf "%q" $te.actorProvider | quote }}
+{{- end }}
+{{- end }}
+{{- range $name, $dest := .Values.destinations }}
+---
+{{/*
+A third-party REST destination. These are the services whose long-lived tokens the gateway holds so
+the pod does not -- the half of the credential story carrying most of the security value, because these are the
+secrets that do not expire.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/destination: {{ $name }}
+spec:
+  static:
+    host: {{ $dest.host | quote }}
+    port: {{ $dest.port | default 443 }}
+
+  policies:
+    # Initiate TLS to the upstream, with SNI set so the upstream presents the right certificate.
+    #
+    # Note that backend TLS takes no minProtocolVersion -- that field is on frontend TLS only. The
+    # protocol floor for a connection the gateway originates is the proxy's own default.
+    tls:
+      sni: {{ $dest.host | quote }}
+
+    auth:
+      {{- if not $dest.secretName }}
+      {{ fail (printf "destination %q has no secretName. A destination with no credential binding is one the agent reaches with no credential, which is either a misconfiguration or a destination that belongs in the network policy's allowlist rather than behind the gateway." $name) }}
+      {{- end }}
+      # The credential, from a Kubernetes Secret the gateway reads, attached where the upstream
+      # expects it. Terraform creates the Secrets Manager secret and never its value; getting that
+      # value into the cluster is a secret syncer's job -- External Secrets Operator or the AWS
+      # Secrets Store CSI driver -- and deliberately not this chart's, because a chart that
+      # templated a secret value would put it in Git.
+      secretRef:
+        name: {{ $dest.secretName | quote }}
+        key: {{ $dest.secretKey | default "token" | quote }}
+      location:
+        header:
+          name: {{ $dest.headerName | default "Authorization" | quote }}
+          prefix: {{ $dest.headerPrefix | default "Bearer " | quote }}
+{{- end }}
+{{- if (.Values.evals | default dict).enabled }}
+{{- if not .Values.evals.judge.roleArn }}
+{{ fail "evals.enabled is true and evals.judge.roleArn is empty. The judge's backend signs its calls with that role, and Terraform creates it with enable_evaluations; without it the judge route would have no credential." }}
+{{- end }}
+---
+{{/*
+The judge's model backend: one model, signed as the judge's own role. See `evals` in values.yaml.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: bedrock-judge-{{ .Values.evals.serviceAccount }}
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/judge: {{ .Values.evals.serviceAccount }}
+spec:
+  ai:
+    provider:
+      bedrock:
+        model: {{ .Values.evals.judge.bedrockModelId | default .Values.model.bedrockModelId | quote }}
+        region: {{ .Values.region | quote }}
+  policies:
+    auth:
+      aws:
+        region: {{ .Values.region | quote }}
+        serviceName: bedrock
+        assumeRole:
+          roleArn: {{ .Values.evals.judge.roleArn | quote }}
+          sessionName: {{ .Values.evals.serviceAccount | quote }}
+          {{- if .Values.model.sessionTags.enabled }}
+          tags:
+            - key: {{ .Values.model.sessionTags.agentKey | quote }}
+              value: {{ .Values.evals.serviceAccount | quote }}
+            - key: {{ .Values.model.sessionTags.clusterKey | quote }}
+              value: {{ .Values.cluster | quote }}
+          {{- end }}
+{{- end }}
+

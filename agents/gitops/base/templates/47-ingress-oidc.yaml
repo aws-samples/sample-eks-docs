@@ -1,0 +1,70 @@
+{{- if and .Values.ingress.enabled (.Values.ingress.oidc | default dict).issuer (not (.Values.ingress.cognito | default dict).userPoolArn) }}
+{{/*
+DIRECT OIDC: THE ONE GRANT EKS AUTO MODE'S MANAGED GATEWAY CONTROLLER NEEDS.
+
+`authenticate-oidc` is the only listener-rule action that reads a Kubernetes Secret -- the client
+id and secret, from ingress.oidcSecretName in the rule's own namespace. EKS Auto Mode's managed
+controllers run off-cluster as the AWSServiceRoleForAmazonEKS service-linked role, and the access
+policies on its access entry grant no Secret access. Without this, every browser rule gets NO status
+at all, its route is rejected with `IncompatibleFilters ... status unknown`, and the load balancer
+serves a fixed-response 500, with nothing naming the cause.
+
+The access entry declares the Kubernetes group `eks:managed`, and RBAC bound to it adds to the
+managed access policies. AWS documents this as the bridging pattern for exactly this case:
+https://docs.aws.amazon.com/eks/latest/userguide/auto-managed-rbac.html. On Gateway API, with this
+Role the rule reaches `accepted: true`, a Secret NOT named here stays unreconciled, and the ALB then
+answers an unauthenticated request with a 302 to the provider carrying the client id read from the
+Secret.
+
+SCOPED AS TIGHTLY AS IT GOES. `eks:managed` is shared by every Auto Mode managed controller --
+compute, storage, networking, load balancing, cluster insights -- so the Role is namespaced to
+namespaces.ingress, names ONE Secret, and grants read verbs only.
+
+`get` is what validating and building the rule needs; AWS's own example grants only that. `list`
+and `watch` are granted too, scoped by resourceNames, because the controller's secrets manager
+(pkg/k8s/secrets_manager.go, newReflector) lists and watches each referenced Secret by a
+metadata.name field selector -- which is how it notices a changed or deleted Secret between
+reconciles. Kubernetes authorizes a name-restricted list or watch only
+when the request filters on that name, so this exposes nothing beyond the one Secret.
+
+A RULE THAT FAILS WITHOUT THIS GRANT STAYS FAILED FOR MINUTES. The controller requeues it with
+exponential backoff, so a grant added after the rule has failed can go unnoticed for over two
+minutes until the rule is touched. Argo CD applies this with the rest of the chart, so on a
+fresh sync the grant and the rules arrive together; on a cluster changed by hand, annotate the rule.
+*/}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: eks-managed-ingress-oidc
+  namespace: {{ .Values.namespaces.ingress }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ .Values.ingress.oidcSecretName | quote }}]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: eks-managed-ingress-oidc
+  namespace: {{ .Values.namespaces.ingress }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: eks-managed-ingress-oidc
+subjects:
+  # The group the AWSServiceRoleForAmazonEKS access entry declares. Check it on your cluster:
+  #   aws eks describe-access-entry --cluster-name <cluster> \
+  #     --principal-arn arn:aws:iam::<account>:role/aws-service-role/eks.amazonaws.com/AWSServiceRoleForAmazonEKS \
+  #     --query accessEntry.kubernetesGroups
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: "eks:managed"
+{{- end }}

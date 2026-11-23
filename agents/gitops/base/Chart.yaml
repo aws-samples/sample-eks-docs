@@ -1,0 +1,22 @@
+apiVersion: v2
+name: eks-agents-base
+description: >-
+  The cluster-level objects both paths share: the agent namespaces and their labels, network
+  policy enforcement, the admission policy that puts agents in a sandbox and keeps every pod off the
+  host network, the egress boundary, and the agent resource definition kro composes an agent from.
+type: application
+
+# Version this chart, not the cluster. The appVersion tracks the repository it ships in; bump the
+# chart version when a template changes so an Argo CD sync is a visible diff rather than a silent
+# re-render.
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords:
+  - eks
+  - agents
+  - nitro-sandbox
+  - kro
+
+annotations:
+  eks-agents/paved-path: shared

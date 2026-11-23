@@ -1,0 +1,28 @@
+# The Service in front of the agent.
+#
+# ClusterIP, with the HTTPRoute in httproute.yaml putting the shared load balancer in front of it. A
+# Service of type LoadBalancer would get an NLB instead, which is the other documented shape -- and
+# which moves the caller's authentication inside the cluster, because an NLB validates no token.
+apiVersion: v1
+kind: Service
+metadata:
+  name: research
+  namespace: agents
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  type: ClusterIP
+
+  selector:
+    # The label the Agent resource stamps on its pods.
+    eks-agents/agent: research
+
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+      # appProtocol http, not http2 or grpc. Match this to what the agent actually serves: a mismatch
+      # between the listener, the target group and the pod is an error, not a fallback.
+      appProtocol: http

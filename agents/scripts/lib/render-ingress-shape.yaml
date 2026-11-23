@@ -1,0 +1,31 @@
+# Placeholder values in the shape terraform apply renders with enable_ingress and enable_chat_ui on.
+# Used by validate.sh to render the chart's ingress-gated components, which the base renders leave
+# off. Every value is an example; none names a real account.
+ingress:
+  enabled: true
+  namespace: ingress
+  scheme: internal
+  domainName: agents.example.com
+  certificateArn: arn:aws:acm:us-west-2:111122223333:certificate/00000000-0000-0000-0000-000000000000
+  loadBalancerCidrs: ["10.0.0.0/16"]
+  cognito:
+    identityProvider: COGNITO
+    userPoolArn: arn:aws:cognito-idp:us-west-2:111122223333:userpool/us-west-2_EXAMPLE
+    userPoolClientId: exampleclientid
+    userPoolDomain: example-agents
+  oidc:
+    issuer: https://cognito-idp.us-west-2.amazonaws.com/us-west-2_EXAMPLE
+    authorizationEndpoint: https://example-agents.auth.us-west-2.amazoncognito.com/oauth2/authorize
+    tokenEndpoint: https://example-agents.auth.us-west-2.amazoncognito.com/oauth2/token
+    userInfoEndpoint: https://example-agents.auth.us-west-2.amazoncognito.com/oauth2/userInfo
+    clientId: exampleclientid
+  dnsReconciler:
+    namespace: external-dns
+    serviceAccount: external-dns
+    roleArn: arn:aws:iam::111122223333:role/example-external-dns
+    zoneId: Z0000000000EXAMPLE
+chatUi:
+  enabled: true
+  agents: ["research"]
+registry:
+  agents/chat-ui: 111122223333.dkr.ecr.us-west-2.amazonaws.com/example/agents/chat-ui

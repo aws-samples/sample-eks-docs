@@ -1,0 +1,82 @@
+{{- if not (has "13-keda.yaml" .Values.excluded) }}
+# KEDA, which starts a task agent's pods from its queue (enable_agent_tasks; Agent runtime: tasks).
+#
+# WHAT IT DOES HERE, and nothing else: it reads the depth of each task agent's SQS queue and, for
+# every waiting message, creates one Job from the agent's ScaledJob -- a pod that kro composed from
+# the same template as every other agent pod, sandboxed, with the agent's own identity. KEDA never
+# reads a message and never holds an agent's credentials.
+#
+# ITS OWN IDENTITY. The operator's service account (keda/keda-operator) has an EKS Pod Identity
+# association to a role that may call sqs:GetQueueAttributes on the task queues and nothing more
+# (terraform/modules/agent-tasks). The base chart's ClusterTriggerAuthentication eks-agents-sqs
+# tells each ScaledJob to use it (identityOwner: keda).
+#
+# BEFORE THE BASE CHART (-10): the Agent resource definition names keda.sh/ScaledJob when tasks are
+# on, and kro validates every kind a graph names when it accepts the graph -- with KEDA's CRDs
+# absent the whole Agent kind would be rejected. Same reason, and same wave, as agent-sandbox.
+#
+# Skipped (in the platform chart's excluded list) unless enable_agent_tasks is on.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: keda
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "-11"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://kedacore.github.io/charts
+    chart: keda
+    # Pinned. See VERSIONS.md.
+    targetRevision: 2.21.0
+    helm:
+      valuesObject:
+        # The operator's service account name is what the Pod Identity association names.
+        serviceAccount:
+          operator:
+            create: true
+            name: keda-operator
+        # No HPA here: a ScaledJob creates Jobs directly, so KEDA's metrics API server is not on
+        # the path. It is still installed, because the chart has no switch for it.
+        resources:
+          operator:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          metricServer:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          webhooks:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+        podLabels:
+          keda:
+            eks-agents-ai-docs: "true"
+
+  destination:
+    name: eks-agents
+    namespace: keda
+
+  syncPolicy:
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      # prune: false. This chart carries the ScaledJob CRD, and pruning a CRD deletes every
+      # ScaledJob on the cluster, and with it every running task's Job.
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # KEDA's CRDs are larger than the client-side apply annotation allows.
+      - ServerSideApply=true
+{{- end }}

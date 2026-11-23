@@ -1,0 +1,336 @@
+{{- if .Values.chatUi.enabled }}
+{{/*
+THE OPERATOR CHAT UI, rendered rather than copied.
+
+A copy applied by hand would need four things edited into it: the image URI, the Region, the
+hostname and the identity provider. Every one of those is already a value this chart holds, and a
+hand-made copy goes wrong in ways that only appear at runtime:
+
+  - a `ListenerRuleConfiguration` in `elbv2.k8s.aws/v1beta1` while the route's own ExtensionRef
+    names `gateway.k8s.aws` -- the CRD is `gateway.k8s.aws/v1`, so the object the route points at
+    does not exist;
+  - an `authenticate-oidc` action without the Secret grant in 47-ingress-oidc.yaml, which EKS Auto
+    Mode's managed gateway controller cannot reconcile, so the route is rejected and the listener
+    serves a fixed-response;
+  - no health check path, so the load balancer checks `/` and this UI answers 404 there -- target
+    permanently unhealthy, caller 504 after a successful login.
+
+This is the one service in these templates a PERSON reaches, which is exactly why it should not be
+the one assembled by hand.
+*/}}
+{{- $gate := printf "%s-gate" .Values.chatUi.name }}
+{{- $host := printf "%s.%s" .Values.chatUi.hostnamePrefix .Values.ingress.domainName }}
+{{- if not .Values.ingress.enabled }}
+{{ fail "chatUi.enabled is true but ingress.enabled is false. This UI is reached by a person through ingress, and its own gate is the load balancer's -- without ingress there is no listener to attach to and nothing authenticates the caller." }}
+{{- end }}
+{{- $image := index .Values.registry "agents/chat-ui" | default "" }}
+{{- if not $image }}
+{{ fail "chatUi.enabled is true but no image is known. `registry` comes from the terraform-values.yaml your path's apply wrote; without it this chart would render an image URI that cannot pull." }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.chatUi.name }}
+  namespace: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+# The UI calls agents with a projected token it mounts explicitly. The default API token would be a
+# second credential it never uses.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.chatUi.name }}
+  namespace: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app: {{ .Values.chatUi.name }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Values.chatUi.name }}
+  ports:
+    - name: http
+      port: {{ .Values.chatUi.port }}
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.chatUi.name }}
+  namespace: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app: {{ .Values.chatUi.name }}
+  # THE LAST WAVE IN THIS CHART, so nothing waits on it. Argo CD applies a wave only once every
+  # resource in the waves before it is healthy, and in wave 0 this Deployment would hold the rest of
+  # eks-agents-base -- the mesh authorization policies and the ingress component's own objects --
+  # behind an ImagePullBackOff until its image is pushed. Its ServiceAccount, Service and route stay
+  # in wave 0; a missing image delays only the UI.
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+spec:
+  replicas: {{ .Values.chatUi.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.chatUi.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.chatUi.name }}
+        app.kubernetes.io/part-of: eks-agents-paved-paths
+        eks-agents-ai-docs: "true"
+        # Opts this pod in to the load balancer ingress and signing-key egress rules in
+        # 32-ingress-network-policy.yaml. Without it the namespace-wide policy selects it for Ingress
+        # with only a same-namespace rule, and the load balancer's ENIs match nothing.
+        eks-agents/ingress: "true"
+    spec:
+      serviceAccountName: {{ .Values.chatUi.name }}
+      automountServiceAccountToken: false
+      # A Service named `chat-ui` injects CHAT_UI_PORT into every pod in the namespace, which
+      # collides with this application's own configuration. Off, deliberately.
+      enableServiceLinks: false
+      # Sandboxed like an agent. The UI holds a credential that reaches an agent, so it is not a
+      # less-sensitive workload than the agent behind it.
+      runtimeClassName: isolated-sandbox
+{{- if and (.Values.nodeClass | default dict).enabled (.Values.nodeClass | default dict).roleName }}
+      # On the agents' own pool, as every Agent is (templates/_agent-pod.tpl), so it runs on a node
+      # in strict network policy mode rather than on a general-purpose node in standard mode.
+      nodeSelector:
+        karpenter.sh/nodepool: {{ (.Values.nodeClass | default dict).name }}
+      tolerations:
+        - key: {{ (.Values.nodeClass | default dict).taintKey }}
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+{{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ .Values.chatUi.name }}
+          image: {{ printf "%s:%s" $image .Values.chatUi.imageTag | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ .Values.chatUi.port }}
+              protocol: TCP
+          env:
+            # Which agents this UI offers, as `name=url` pairs. Derived from the names below so the
+            # UI and the agents cannot disagree about a hostname.
+            - name: CHAT_UI_AGENTS
+              value: {{ range $i, $a := .Values.chatUi.agents }}{{ if $i }},{{ end }}{{ printf "%s=http://%s.%s.svc.cluster.local:8080" $a $a $.Values.namespaces.reasoning }}{{ end }}
+            - name: AWS_REGION
+              value: {{ .Values.region | quote }}
+            # Which load balancer may sign x-amzn-oidc-data, and for which client. Every ALB in a
+            # Region signs with the same keys, so a verified signature alone admits another
+            # account's ALB in front of another identity provider.
+            - name: ALB_EXPECTED_ACCOUNT_ID
+              value: {{ if regexMatch "^[0-9]{12}$" (toString .Values.accountId) }}{{ .Values.accountId | quote }}{{ else }}""{{ end }}
+            - name: ALB_EXPECTED_CLIENT_ID
+              # The client the load balancer signs in with: the Cognito app client, or, with
+              # oidc-direct (no pool), the provider's own client.
+              value: {{ (.Values.ingress.cognito | default dict).userPoolClientId | default (.Values.ingress.oidc | default dict).clientId | default "" | quote }}
+            - name: AGENT_IDENTITY_TOKEN_FILE
+              value: /var/run/secrets/eks-agents/agent/token
+            # Forward the signed-in person's access token to the agent (enable_person_access), for a
+            # tool that verifies the person itself. Off: the agent gets the person as context only.
+            - name: CHAT_UI_FORWARD_PERSON_TOKEN
+              value: {{ (.Values.personAccess | default dict).enabled | default false | toString | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - name: agent-identity
+              mountPath: /var/run/secrets/eks-agents/agent
+              readOnly: true
+          {{/*
+          EXEC PROBES, NOT httpGet. A kubelet network probe against a pod in a Nitro sandbox fails in
+          an ambient-enrolled namespace, and the pod crash-loops; scripts/validate.sh refuses a
+          network probe on a sandboxed pod. The load balancer's own health check reaches the pod,
+          which is what the TargetGroupConfiguration below configures.
+          */}}
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import sys, urllib.request
+                  sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:{{ .Values.chatUi.port }}/healthz", timeout=3).status == 200 else 1)
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import sys, urllib.request
+                  sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:{{ .Values.chatUi.port }}/healthz", timeout=3).status == 200 else 1)
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: agent-identity
+          projected:
+            defaultMode: 0400
+            sources:
+            {{- range .Values.chatUi.agents }}
+              # One source per agent, because a projected token names exactly ONE audience and each
+              # agent verifies its own name as the audience.
+              - serviceAccountToken:
+                  audience: {{ . | quote }}
+                  expirationSeconds: 600
+                  path: {{ if eq (len $.Values.chatUi.agents) 1 }}token{{ else }}{{ printf "%s-token" . }}{{ end }}
+            {{- end }}
+---
+{{/*
+The gate: `authenticate-cognito` with a pool, `authenticate-oidc` with a directly called provider --
+and `authenticate`, not `deny`, because a person needs a login page rather than a 401.
+
+In namespaces.ingress with the route, like every browser rule: see 00-namespaces.yaml and the
+httpRouteBrowser resource in 40-agent-rgd.yaml for why browser rules live apart from the workloads.
+*/}}
+apiVersion: gateway.k8s.aws/v1
+kind: ListenerRuleConfiguration
+metadata:
+  name: {{ $gate }}
+  namespace: {{ .Values.namespaces.ingress }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  actions:
+{{- /* `| default dict` throughout: Terraform writes `cognito: null` under ingress_idp =
+     "oidc-direct", and a null in a later values file DELETES the key, so a bare
+     .Values.ingress.cognito.userPoolArn is a nil-pointer render error that fails the whole
+     eks-agents-base sync. The RGD guards the same way. */}}
+{{- if (.Values.ingress.cognito | default dict).userPoolArn }}
+    - type: authenticate-cognito
+      authenticateCognitoConfig:
+        userPoolArn: {{ (.Values.ingress.cognito | default dict).userPoolArn | quote }}
+        userPoolClientId: {{ (.Values.ingress.cognito | default dict).userPoolClientId | quote }}
+        userPoolDomain: {{ (.Values.ingress.cognito | default dict).userPoolDomain | quote }}
+        scope: "openid email"
+        onUnauthenticatedRequest: authenticate
+{{- with (.Values.ingress.cognito | default dict).identityProvider }}
+        authenticationRequestExtraParams:
+          identity_provider: {{ . | quote }}
+{{- end }}
+{{- else if (.Values.ingress.oidc | default dict).issuer }}
+    # DIRECT OIDC: see the same branch in 40-agent-rgd.yaml. The Secret and the grant that lets EKS
+    # Auto Mode's managed controller read it are in 47-ingress-oidc.yaml.
+    - type: authenticate-oidc
+      authenticateOIDCConfig:
+        issuer: {{ .Values.ingress.oidc.issuer | quote }}
+        authorizationEndpoint: {{ .Values.ingress.oidc.authorizationEndpoint | quote }}
+        tokenEndpoint: {{ .Values.ingress.oidc.tokenEndpoint | quote }}
+        userInfoEndpoint: {{ .Values.ingress.oidc.userInfoEndpoint | quote }}
+        secret:
+          name: {{ .Values.ingress.oidcSecretName | quote }}
+        scope: "openid email"
+        onUnauthenticatedRequest: authenticate
+{{- else }}
+{{ fail "chatUi.enabled is true and no identity provider is configured. This UI is for a person, and a person's identity is established at the load balancer -- set ingress.cognito or ingress.oidc (Terraform's ingress_idp). Rendering it with no gate would publish a chat window onto an agent." }}
+{{- end }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ .Values.chatUi.name }}
+  namespace: {{ .Values.namespaces.ingress }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ .Values.ingress.gatewayName }}
+      namespace: {{ .Values.ingress.namespace }}
+      sectionName: https
+
+  hostnames:
+    # Derived from the platform's own domain, so there is no placeholder to edit and no hostname the
+    # listener certificate does not cover.
+    - {{ $host | quote }}
+
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        # In the reasoning namespace, reached through the ReferenceGrant below.
+        - name: {{ .Values.chatUi.name }}
+          namespace: {{ .Values.namespaces.reasoning }}
+          port: {{ .Values.chatUi.port }}
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.k8s.aws
+            kind: ListenerRuleConfiguration
+            name: {{ $gate }}
+---
+{{/*
+The permission for the route above, in the ingress namespace, to reach this Service and no other.
+*/}}
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: {{ printf "%s-ingress" .Values.chatUi.name }}
+  namespace: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: {{ .Values.namespaces.ingress }}
+  to:
+    - group: ""
+      kind: Service
+      name: {{ .Values.chatUi.name }}
+---
+{{/*
+The health check path, and `ip` targets. The default is `/`, which this UI answers 404 on, so
+without this the target is registered, reachable and permanently unhealthy -- and the symptom is a
+504 AFTER a successful login, with nothing naming a health check.
+*/}}
+apiVersion: gateway.k8s.aws/v1
+kind: TargetGroupConfiguration
+metadata:
+  name: {{ .Values.chatUi.name }}
+  namespace: {{ .Values.namespaces.reasoning }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  targetReference:
+    group: ""
+    kind: Service
+    name: {{ .Values.chatUi.name }}
+  defaultConfiguration:
+    targetType: ip
+    healthCheckConfig:
+      healthCheckPath: /healthz
+      healthCheckProtocol: HTTP
+{{- end }}

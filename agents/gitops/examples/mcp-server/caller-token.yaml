@@ -1,0 +1,62 @@
+# SUPERSEDED ON THE AGENT-RESOURCE PATH -- set `mcpAudience` on the Agent instead.
+#
+# This file is a strategic-merge patch on the agent's Deployment. That Deployment is composed by
+# gitops/base/templates/40-agent-rgd.yaml, so kro owns it and reconciles the patch away. It appears
+# to work because kro reconciles on change rather than continuously: the patch survives until the
+# next time anything touches the Agent, and then the second token and the direct MCP URL vanish
+# with no event anywhere. The tools phase of scripts/exercise.sh passes, then fails again once an
+# unrelated chart upgrade rolls the pod.
+#
+# The supported way is one field:
+#
+#   apiVersion: agents.eks.amazonaws.com/v1alpha1
+#   kind: Agent
+#   spec:
+#     mcpAudience: mcp-server
+#     mcpUrl: http://mcp-server.mcp-servers.svc.cluster.local:8080/mcp
+#
+# which projects the second token and sets AGENT_MCP_TOKEN_FILE on every pod the Agent composes,
+# including every pod it composes later.
+#
+# Keep this file only for a hand-written Deployment -- an agent the resource definition does not
+# compose, which is the case the AWS services path's README describes.
+#
+# How a caller gets a token this MCP server accepts.
+#
+# An agent composed by the Agent resource already projects a token for the egress gateway's
+# audience. Reaching the MCP server directly -- which is how an agent on the AWS services path uses
+# it, because AgentCore Gateway runs outside the cluster and cannot reach a ClusterIP Service --
+# needs a second projected volume, because a token names ONE audience.
+#
+# This is the patch to add to such an agent's Deployment. The Agent resource does not generate it:
+# a second audience is a per-agent decision, and projecting one for every agent would hand every
+# agent a credential for a server most of them do not call.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: research
+  namespace: agents
+spec:
+  template:
+    spec:
+      containers:
+        - name: agent
+          env:
+            - name: AGENT_MCP_URL
+              value: http://mcp-server.mcp-servers.svc.cluster.local:8080/mcp
+            - name: AGENT_MCP_TOKEN_FILE
+              value: /var/run/secrets/eks-agents/mcp/token
+          volumeMounts:
+            - name: mcp-identity
+              mountPath: /var/run/secrets/eks-agents/mcp
+              readOnly: true
+      volumes:
+        - name: mcp-identity
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken:
+                  # The audience the MCP server checks. A token minted for anything else is refused.
+                  audience: mcp-server
+                  expirationSeconds: 600
+                  path: token

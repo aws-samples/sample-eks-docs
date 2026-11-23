@@ -1,0 +1,374 @@
+{{- if not (has "20-istio.yaml" .Values.excluded) }}
+# Istio in ambient mode: the layer that makes arrival at the gateway enforced rather than agreed.
+#
+# Without this, pointing a workload at the gateway is a configuration it can ignore. The network
+# policy means a workload that ignores it reaches nothing, which fails closed — so the base layer is
+# safe without the mesh. What the mesh buys is different, for unsandboxed pods; a pod in a Nitro
+# sandbox isn't captured. For a captured pod it intercepts the outbound connections and carries
+# them over an mTLS tunnel stamped with the workload's verified identity, so the workload needs no
+# gateway configuration of its own.
+#
+# If every workload on the cluster is one the platform team builds or packages, the mesh is
+# optional and this is the component to leave out: it is three charts and a data plane to operate.
+#
+# WHERE THE IDENTITY COMES FROM. The mesh issues it, under a per-cluster trust domain. Read that
+# before building on it: the identity is scoped to the cluster, is not a trust domain you own, and
+# cannot be presented to a system outside the cluster, so it does not serve the
+# external-authentication case.
+#
+# AMBIENT ONLY, AND SIDECAR MODE IS NOT AN ALTERNATIVE HERE. Ambient puts one proxy per node, so
+# there is no sidecar per agent and a pod has no path around it. But the reason it is the only
+# supported mode is narrower than that and specific to agents: in sidecar mode a compromised
+# application pod gives access to mesh keys, and on this stack the application pod is assumed to be
+# running untrusted model-generated code — so a sidecar would put a mesh private key inside the pod
+# the Nitro Sandbox exists to contain. The agents-mesh page of the EKS User Guide has the full
+# reasoning and the cost it accepts.
+#
+# The agents-mesh page of the EKS User Guide compares the two values of mesh_mode, including what
+# each one costs.
+#
+# Do not "just add sidecar injection" to this file. Istio resolves a namespace labelled for both
+# modes in favour of sidecar, so that change would replace the enforcement model silently; the
+# admission policy in gitops/base refuses the resulting pods.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: istio-base
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    # BEFORE the base chart (-10): istio-base is the Istio CRDs and cluster-wide base objects, and the
+    # base chart renders AuthorizationPolicy and PeerAuthentication when the mesh is on. After it, the
+    # base chart's first sync fails on `no matches for kind "AuthorizationPolicy"`, which Argo CD
+    # only gets past on retries and install-platform.sh does not get past at all.
+    argocd.argoproj.io/sync-wave: "-13"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://blob.istio.io/istio-release/charts
+    chart: base
+    targetRevision: 1.31.4
+
+  destination:
+    name: eks-agents
+    namespace: istio-system
+
+  # ISTIO REWRITES ITS OWN WEBHOOK CONFIGURATION, so without this the Application never reaches
+  # Synced. istiod's validationController patches the `caBundle` into its
+  # ValidatingWebhookConfiguration at runtime -- the log line is `validationController successfully
+  # updated name=istiod-default-validator` -- and that field is empty in the chart output. Argo CD
+  # compares the two and reports drift on every reconcile, forever.
+  #
+  # Without it, this Application sits permanently OutOfSync on its ValidatingWebhookConfiguration
+  # while every pod is healthy and the mesh is serving traffic.
+  # With selfHeal on, Argo CD also keeps blanking a field istiod immediately rewrites, which is a
+  # write loop between two controllers rather than a convergence.
+  #
+  # Ignoring the field is correct rather than a workaround: the CA bundle is runtime state owned by
+  # istiod, and Git has no business asserting a value for it. Scoped to the two Applications that
+  # actually carry webhook configurations -- istio-cni and ztunnel do not.
+  ignoreDifferences:
+    # IGNORE EVERY FIELD ISTIOD OWNS, not a list of field paths.
+    #
+    # istiod writes to its own webhooks at runtime through the `pilot-discovery` field manager, and
+    # `caBundle` is only one of the fields it takes. The manager owns TWO:
+    #
+    #   manager=pilot-discovery op=Update
+    #     f:webhooks -> k:{"name":"rev.validation.istio.io"}
+    #       f:clientConfig -> f:caBundle
+    #       f:failurePolicy
+    #
+    # The chart renders `failurePolicy: Ignore` and istiod flips it to `Fail` once it is ready to
+    # validate -- which is correct Istio behaviour and permanent drift to Argo CD. Ignoring the
+    # caBundle alone therefore leaves the Application OutOfSync forever, with selfHeal rewriting the
+    # field on every reconcile. Same failure mode as a Helm chart generating a random password: the
+    # loop is indistinguishable from a controller problem until you read the managed fields.
+    #
+    # `managedFieldsManagers` is the right tool because it tracks whatever istiod decides to own,
+    # rather than a list that silently goes stale the next time it takes one more field. Find the
+    # manager with:
+    #
+    #   kubectl get validatingwebhookconfiguration <name> --show-managed-fields -o json \
+    #     | jq '.metadata.managedFields[] | {manager, fieldsV1}'
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      managedFieldsManagers:
+        - pilot-discovery
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      managedFieldsManagers:
+        - pilot-discovery
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      # Same reasoning as the Gateway API CRDs: this chart carries Istio's CRDs, and pruning them
+      # deletes every policy written against them.
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: istio-cni
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "-3"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://blob.istio.io/istio-release/charts
+    chart: cni
+    targetRevision: 1.31.4
+
+    helm:
+      valuesObject:
+        # ISTIO RETIRED ITS OWN REGISTRY AND CHART HOST. registry.istio.io, gcr.io/istio-release and
+        # istio-release.storage.googleapis.com go away for good in December 2026 (istio.io/latest/blog/
+        # 2026/retirement-of-gcp) and are switched off in announced windows before that; a node that
+        # joins during one cannot pull ztunnel or istio-cni (a 403 from the registry's token endpoint). Set both keys Istio names rather than relying on the chart's default hub.
+        hub: docker.io/istio
+        global:
+          hub: docker.io/istio
+        profile: ambient
+
+        # EKS Auto Mode nodes run containerd with the standard CNI directories, so no path override
+        # is needed. On EKS on EC2 with a custom AMI, check cniConfDir and cniBinDir against the
+        # AMI's layout: a mismatch leaves istio-cni running and capturing nothing, which looks
+        # healthy and enforces nothing.
+        cni:
+          ambient:
+            enabled: true
+
+  destination:
+    name: eks-agents
+    namespace: istio-system
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: istiod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "-2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://blob.istio.io/istio-release/charts
+    chart: istiod
+    targetRevision: 1.31.4
+
+    helm:
+      valuesObject:
+        # ISTIO RETIRED ITS OWN REGISTRY AND CHART HOST. registry.istio.io, gcr.io/istio-release and
+        # istio-release.storage.googleapis.com go away for good in December 2026 (istio.io/latest/blog/
+        # 2026/retirement-of-gcp) and are switched off in announced windows before that; a node that
+        # joins during one cannot pull ztunnel or istio-cni (a 403 from the registry's token endpoint). Set both keys Istio names rather than relying on the chart's default hub.
+        hub: docker.io/istio
+        global:
+          hub: docker.io/istio
+        profile: ambient
+
+        # NO HORIZONTAL POD AUTOSCALER: no metrics-server is installed (an EKS cluster created
+        # through the API or Terraform has none, EKS Auto Mode included), so nothing serves the
+        # metrics.k8s.io API -- the v1.metrics.eks.amazonaws.com APIService EKS registers serves
+        # control-plane Prometheus metrics, not resource metrics -- and the chart's default HPA
+        # sits at `cpu: <unknown>/80%`
+        # (ScalingActive=False, FailedGetResourceMetric) and Argo CD reports istiod Degraded while it
+        # serves normally -- which also keeps bootstrap-gitops.sh --sync waiting until its timeout.
+        # The aws-services path's 55-istio.yaml sets the same. One control-plane replica is the
+        # deliberate shape; install metrics-server before turning autoscaling back on.
+        autoscaleEnabled: false
+
+        # The trust domain agent identities are issued under. Per-cluster on this stack; see the
+        # header. Keep it consistent with mesh.trustDomain in the base chart's values and with
+        # mesh_trust_domain in Terraform, because the gateway's routes are keyed on identities in
+        # this domain and a mismatch means the gateway admits nobody.
+        meshConfig:
+          trustDomain: cluster.local
+
+          # Every agent's egress leaves the mesh for the gateway, so there is no case for allowing
+          # a pod to reach an arbitrary external host just because the mesh does not know it.
+          # REGISTRY_ONLY makes an unknown destination a mesh-level failure as well as a network
+          # policy one.
+          outboundTrafficPolicy:
+            mode: REGISTRY_ONLY
+
+          defaultConfig:
+            # Trace context is propagated between workloads, so on-behalf-of context survives each
+            # hop: a header the mesh strips is a hop that loses it.
+            tracing:
+              sampling: 100.0
+  destination:
+    name: eks-agents
+    namespace: istio-system
+
+  # ISTIO REWRITES ITS OWN WEBHOOK CONFIGURATION, so without this the Application never reaches
+  # Synced. istiod's validationController patches the `caBundle` into its
+  # ValidatingWebhookConfiguration at runtime -- the log line is `validationController successfully
+  # updated name=istiod-default-validator` -- and that field is empty in the chart output. Argo CD
+  # compares the two and reports drift on every reconcile, forever.
+  #
+  # Without it, this Application sits permanently OutOfSync on its ValidatingWebhookConfiguration
+  # while every pod is healthy and the mesh is serving traffic.
+  # With selfHeal on, Argo CD also keeps blanking a field istiod immediately rewrites, which is a
+  # write loop between two controllers rather than a convergence.
+  #
+  # Ignoring the field is correct rather than a workaround: the CA bundle is runtime state owned by
+  # istiod, and Git has no business asserting a value for it. Scoped to the two Applications that
+  # actually carry webhook configurations -- istio-cni and ztunnel do not.
+  ignoreDifferences:
+    # IGNORE EVERY FIELD ISTIOD OWNS, not a list of field paths.
+    #
+    # istiod writes to its own webhooks at runtime through the `pilot-discovery` field manager, and
+    # `caBundle` is only one of the fields it takes. The manager owns TWO:
+    #
+    #   manager=pilot-discovery op=Update
+    #     f:webhooks -> k:{"name":"rev.validation.istio.io"}
+    #       f:clientConfig -> f:caBundle
+    #       f:failurePolicy
+    #
+    # The chart renders `failurePolicy: Ignore` and istiod flips it to `Fail` once it is ready to
+    # validate -- which is correct Istio behaviour and permanent drift to Argo CD. Ignoring the
+    # caBundle alone therefore leaves the Application OutOfSync forever, with selfHeal rewriting the
+    # field on every reconcile. Same failure mode as a Helm chart generating a random password: the
+    # loop is indistinguishable from a controller problem until you read the managed fields.
+    #
+    # `managedFieldsManagers` is the right tool because it tracks whatever istiod decides to own,
+    # rather than a list that silently goes stale the next time it takes one more field. Find the
+    # manager with:
+    #
+    #   kubectl get validatingwebhookconfiguration <name> --show-managed-fields -o json \
+    #     | jq '.metadata.managedFields[] | {manager, fieldsV1}'
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      managedFieldsManagers:
+        - pilot-discovery
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      managedFieldsManagers:
+        - pilot-discovery
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ztunnel
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: https://blob.istio.io/istio-release/charts
+    chart: ztunnel
+    targetRevision: 1.31.4
+    helm:
+      valuesObject:
+        # ISTIO RETIRED ITS OWN REGISTRY AND CHART HOST. registry.istio.io, gcr.io/istio-release and
+        # istio-release.storage.googleapis.com go away for good in December 2026 (istio.io/latest/blog/
+        # 2026/retirement-of-gcp) and are switched off in announced windows before that; a node that
+        # joins during one cannot pull ztunnel or istio-cni (a 403 from the registry's token endpoint). Set both keys Istio names rather than relying on the chart's default hub.
+        hub: docker.io/istio
+        global:
+          hub: docker.io/istio
+
+  destination:
+    name: eks-agents
+    namespace: istio-system
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+{{- end }}

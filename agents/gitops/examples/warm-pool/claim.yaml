@@ -1,0 +1,64 @@
+# One session's claim on the pool.
+#
+# Created per user session or per task, by the reasoning tier at run time rather than by a platform
+# team in Git. It is here as the shape to create, not as something to apply from this directory and
+# leave behind.
+#
+# The claim adopts a pod that is already booted and Ready, which is where the sub-second adoption
+# comes from, and the pool boots a replacement in the background.
+#
+# The reasoning tier that creates these needs Kubernetes API access, which is the one case where
+# needsClusterApi on an Agent resource should be true. Scope the RBAC to the claim lifecycle and
+# the claimed pod in this namespace, and nothing else. See rbac.yaml.
+#
+# And the claim's identity is configuration, never a tool argument. The pool it claims from and the
+# namespace it claims in are set in the reasoning tier's environment, so the model cannot point the
+# tool at another namespace's pool.
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata:
+  # One per session. Name it from the session identifier, so an abandoned claim is traceable to the
+  # session that abandoned it.
+  name: session-REPLACE
+  namespace: agents-execution
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  warmPoolRef:
+    name: execution-pool
+
+  # The session's workspace, and the only thing in this architecture that survives a suspend.
+  #
+  # On the CLAIM rather than on the template, so an idle warm pod provisions no storage: the volume
+  # is created when a session starts. The template has to opt in with
+  # volumeClaimTemplatesPolicy: Allowed, or this is rejected.
+  #
+  # ReadWriteOncePod, not ReadWriteOnce. ReadWriteOnce promises only one NODE, so two pods on that
+  # node could mount one session's workspace at the same time; ReadWriteOncePod promises one pod.
+  #
+  # IMMUTABLE once created -- the CRD validates it with CEL. Changing the size, class or access mode
+  # means deleting and recreating, which deletes the workspace with it. Suspend preserves data;
+  # delete never does.
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        accessModes: ["ReadWriteOncePod"]
+        # The class gitops/base/templates/15-storage-class.yaml ships. Named rather than left to
+        # the cluster default, so a cluster with a different default does not silently provision
+        # this session's workspace somewhere else.
+        storageClassName: eks-agents-gp3
+        resources:
+          requests:
+            storage: 10Gi
+
+  # When an abandoned session stops costing anything.
+  #
+  # Retain is the default, and it means an abandoned claim holds a sandbox and a volume until
+  # somebody deletes it -- which on a per-session resource is a leak with a cost attached. Delete
+  # after a TTL bounds it. Raise the TTL if a session may legitimately idle longer than this; the
+  # claim is deleted at the end of it either way, and the workspace goes with it.
+  lifecycle:
+    shutdownPolicy: Delete
+    ttlSecondsAfterFinished: 3600

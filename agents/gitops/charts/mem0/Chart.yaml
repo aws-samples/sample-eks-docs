@@ -1,0 +1,19 @@
+apiVersion: v2
+name: mem0
+description: >-
+  Mem0, the consolidation layer for memory rung 3 on the open source path.
+
+  This chart is written here because the project ships none. Upstream provides a Dockerfile and a
+  docker-compose file, so running it on Kubernetes means somebody writes the manifests, and that
+  somebody should not be each adopting team separately.
+type: application
+
+version: 0.1.0
+
+# The image's own tag, which is the only tag it has. See values.yaml on why that is a problem and
+# what this chart does about it.
+appVersion: "latest"
+
+annotations:
+  eks-agents/paved-path: open-source
+  eks-agents/memory-rung: consolidation

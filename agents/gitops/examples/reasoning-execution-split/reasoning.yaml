@@ -1,0 +1,117 @@
+# REQUIRES THE AGENT RESOURCE DEFINITION, which Terraform switches off if you declared agents there.
+#
+# This is an `Agent`, a custom resource composed by kro from gitops/base/templates. That definition
+# only renders when `agentResource.enabled` is true, and the Terraform roots derive that as
+# `length(var.agents) == 0`. So if terraform.tfvars declares an `agents` map, this file cannot be
+# applied -- the CRD does not exist -- and nothing says so: the base chart reports Synced and
+# Healthy because the definition is absent rather than broken.
+#
+# Check before applying:
+#
+#   # agents.agents.eks.amazonaws.com -- the plural, then the group.
+#   kubectl get crd agents.agents.eks.amazonaws.com    # must exist
+#   kubectl get resourcegraphdefinitions        # the definition kro reconciles
+#
+# If the CRD is missing, either set `agents = {}` and re-apply Terraform, or deploy this tier as an
+# ordinary Deployment against the service account Terraform created for it.
+# The reasoning tier, declared as one Agent resource.
+#
+# Everything this produces — the ServiceAccount with token mounting off, the IAM role with its trust
+# and permission policies, the Pod Identity association, the network policy and the Deployment under
+# the sandbox runtime class — comes from the resource definition in
+# gitops/base/templates/40-agent-rgd.yaml. Without it this would be six objects in three languages,
+# restated per agent.
+#
+# What is NOT a field here, and why that is the point:
+#   runtimeClassName            baked in. An agent that is not sandboxed is not an agent this
+#                               platform runs, and the admission policy would refuse it anyway.
+#   automountServiceAccountToken set from needsClusterApi, on the ServiceAccount rather than the pod
+#                               spec, so a workload template added later cannot get the token back.
+#   hostNetwork / hostPID / hostIPC  absent, and refused at admission.
+#   the permissions boundary    on the role, so this file cannot ask for authority outside it.
+apiVersion: agents.eks.amazonaws.com/v1alpha1
+kind: Agent
+metadata:
+  name: research
+  namespace: agents
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/tier: reasoning
+spec:
+  # The reference agent from apps/reference, built into the ECR repository the cluster module
+  # created by ./scripts/build-images.sh. The registry URL is the ecr_repository_urls Terraform
+  # output. By hand, from apps/ (every Dockerfile copies common/):
+  #
+  #   docker build -f reference/Dockerfile -t "$ECR/agents/reasoning:v1" .
+  #   docker push "$ECR/agents/reasoning:v1"
+  #
+  # That image is a Strands agent wired to this stack's four contracts: it reaches the model through
+  # the gateway rather than the Bedrock SDK, keeps session state and checkpoints outside the pod,
+  # and emits OpenTelemetry with the GenAI semantic conventions. apps/reference/README.md says
+  # what each contract costs if an agent ignores it.
+  image: REPLACE_ECR_URL/agents/reasoning:v1
+
+  # A Deployment rather than the default Sandbox, and the reason is the two replicas: this agent keeps
+  # its session state and checkpoints outside the pod, so any replica can serve any turn and the
+  # load balances across them. A Sandbox is one pod with a stable identity -- the right shape for an
+  # agent whose working state lives in the pod, and the default for every Agent that does not say.
+  runtime: deployment
+  replicas: 2
+
+  # The model ARNs this agent may invoke, and the whole of what it may invoke. A list rather than a
+  # boolean, because "may call Bedrock" is not a scope.
+  #
+  # On the open source path the gateway assumes this agent's role and signs the call on it, so the
+  # scope here is what the gateway's model access becomes when acting as this agent. With no gateway
+  # the agent signs its own call with this role.
+  modelArns:
+  # A CROSS-REGION INFERENCE PROFILE NEEDS THE FOUNDATION MODEL IN EVERY REGION IT ROUTES TO, not
+  # just the one the profile lives in. The `us.` prefix is what makes it cross-region: Bedrock may
+  # serve the call from us-east-1, us-east-2 or us-west-2, and IAM authorizes against the
+  # foundation-model ARN in whichever region actually served it.
+  #
+  # Granting one region fails with a bare AccessDenied that the gateway reports only as
+  # `http.status=403`, with the right route, the right backend and the right jwt.sub in its access
+  # log -- so it reads as a model-access or role problem rather than a missing region, even for a
+  # role that is otherwise correct: trust policy, inline policy and permissions boundary all naming
+  # Bedrock.
+  #
+  # Use a single-region profile instead and one ARN is enough; the trade is that a single region
+  # cannot shed load to another.
+    - arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-5-5
+    - arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-sonnet-5-5
+    - arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-5-5
+    - arn:aws:bedrock:us-west-2:ACCOUNT_ID:inference-profile/us.anthropic.claude-sonnet-5-5
+
+  # Required on every model call as an authorization condition, so an agent that omits it gets
+  # AccessDenied rather than an ungoverned response. The guardrail is not something this agent's code
+  # can decide to skip.
+  #
+  # A specific version, not DRAFT: requiring DRAFT means the content controls change whenever
+  # somebody edits the guardrail.
+  guardrailArn: arn:aws:bedrock:us-west-2:ACCOUNT_ID:guardrail/REPLACE
+  guardrailVersion: "1"
+
+  # False. This agent reasons and calls a model; it has no reason to call the Kubernetes API, and a
+  # mounted token would be a usable credential in the filesystem of the pod whose next model
+  # response decides what runs.
+  #
+  # Contrast gitops/examples/warm-pool, where the reasoning tier does need it: driving an Agent
+  # Sandbox claim is a Kubernetes API call, and that example scopes the RBAC to exactly it.
+  needsClusterApi: false
+
+  # Reachable from inside the cluster, which is what the chat UI and other in-cluster callers
+  # need.
+  #
+  # Change to "route" for ingress, with routeHostname if the name is not <agent>.<ingress domain>.
+  # There is no value that produces an internet-facing load balancer: see gitops/examples/mcp-ingress for
+  # the decisions that come with exposing an agent, and note that an internet-facing ingress is a
+  # hand-written Ingress somebody reviews rather than a field here.
+  expose: cluster
+  port: 8080
+
+  cpuRequest: "1"
+  memoryRequest: 4Gi
+  cpuLimit: "4"
+  memoryLimit: 8Gi

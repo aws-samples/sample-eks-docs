@@ -1,0 +1,62 @@
+{{- if .Values.policyDecisions.enabled }}
+{{- $pd := .Values.policyDecisions }}
+{{/*
+The two scrapes the policy decisions dashboard needs that nothing else makes.
+
+ztunnel counts every connection it carries, and a connection an AuthorizationPolicy refused is
+counted in istio_tcp_connections_closed_total with response_flags="DENY" -- not in the opened
+counter, whose flag stays "-" (for example, a pod in agentgateway-system with the default service
+account calling the MCP server, which admits only the gateway's identity). Nothing else scrapes
+ztunnel. Prometheus reaches the ztunnel on an agent node because istio-system and monitoring are
+infrastructure namespaces in the agents' cluster network policy; the API server's pod proxy does
+not, so `kubectl get --raw .../proxy/metrics` times out there.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: ztunnel
+  namespace: {{ .Values.dashboard.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ $pd.ztunnel.namespace }}
+  selector:
+    matchLabels:
+      {{- toYaml $pd.ztunnel.podSelector | nindent 6 }}
+  podMetricsEndpoints:
+    - port: {{ $pd.ztunnel.portName }}
+      path: {{ $pd.ztunnel.path }}
+      interval: {{ $pd.ztunnel.interval }}
+      # Only the connection counters: ztunnel's other series are per-proxy internals.
+      metricRelabelings:
+        - sourceLabels: [__name__]
+          regex: istio_tcp_connections_(opened|closed)_total
+          action: keep
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: netpol-verdicts
+  namespace: {{ .Values.dashboard.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ $pd.netpolVerdicts.namespace }}
+  selector:
+    matchLabels:
+      {{- toYaml $pd.netpolVerdicts.podSelector | nindent 6 }}
+  podMetricsEndpoints:
+    - port: {{ $pd.netpolVerdicts.portName }}
+      interval: {{ $pd.netpolVerdicts.interval }}
+      relabelings:
+        # Which agent node decided.
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+{{- end }}

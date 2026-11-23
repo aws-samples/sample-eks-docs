@@ -1,0 +1,56 @@
+{{- if not (has "46-consent-receiver.yaml" .Values.excluded) }}
+# The OAuth consent receiver (gitops/charts/consent-receiver): a person approves a third-party
+# service once and the egress gateway attaches the resulting token. In the platform chart's excluded
+# list (Terraform's platform_excluded) unless Terraform's oauth_consent names a client.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: consent-receiver
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    # After the platform secrets, whose syncer in the gateway's namespace it restarts.
+    argocd.argoproj.io/sync-wave: "3"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+  source:
+    repoURL: {{ .Values.repo.url }}
+    targetRevision: {{ .Values.repo.revision }}
+    path: {{ .Values.repo.path }}gitops/charts/consent-receiver
+    helm:
+      valueFiles:
+        - values.yaml
+      # ignoreMissingValueFiles stays at its default, false, so a missing values file fails the
+      # render. Not written out: the EKS Argo CD capability rewrites Application objects and drops
+      # a false field, so the root Application would compare Git's false with nothing and stay
+      # OutOfSync.
+      # The rendered values (terraform), passed by the root Application.
+      values: |
+        {{- toYaml .Values.terraform | nindent 8 }}
+  destination:
+    name: eks-agents
+    namespace: consent
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+{{- end }}

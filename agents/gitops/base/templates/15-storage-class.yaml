@@ -1,0 +1,53 @@
+{{- if .Values.storageClass.create }}
+{{/*
+A default StorageClass, which EKS Auto Mode does not create for you.
+
+THIS IS A REQUIRED STEP THAT IS EASY TO MISS. Auto Mode's `storageConfig.blockStorage.enabled`
+installs the EBS CSI driver and runs it off-cluster, so `kubectl get csidriver` shows
+ebs.csi.eks.amazonaws.com and everything looks ready. What it does not do is create a StorageClass.
+With no default, every PersistentVolumeClaim on the cluster stays Pending:
+
+  Failed to schedule pod, unbound pvc must define a storage class
+  (PersistentVolumeClaim=monitoring/..., StorageClass=)
+
+On this stack that blocks three things at once, which is why it is in the base chart rather than left
+to each component: the Prometheus volume on the open source path, the session-state cache's volumes,
+and -- the one that matters most -- the workspace volume behind Agent Sandbox suspend and resume. An
+agent's files surviving a suspend is the whole point of that feature, and it needs a bound volume.
+
+gp3 with encryption on. Unencrypted agent workspaces are not a defensible default: the workspace is
+where staged data and model-generated code live.
+*/}}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .Values.storageClass.name }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    storageclass.kubernetes.io/is-default-class: {{ .Values.storageClass.default | quote }}
+provisioner: ebs.csi.eks.amazonaws.com
+
+# WaitForFirstConsumer, not Immediate. An EBS volume is zonal, so provisioning it before the pod is
+# scheduled can place it in an Availability Zone the pod cannot be scheduled into -- and on a
+# sandboxed pod, which Auto Mode may place on a sandbox-capable instance in a particular zone, that
+# is a real failure rather than a theoretical one.
+volumeBindingMode: WaitForFirstConsumer
+
+# Retain is wrong here and Delete is right, which is worth saying because it looks careless.
+# A workspace volume's lifecycle is owned by the Sandbox that created it: the PVC carries the Sandbox
+# as its ownerReference, so deleting the Sandbox deletes the claim. Retain would leave orphaned EBS
+# volumes accumulating for every agent session anyone ever ran. Suspend is what preserves a
+# workspace; delete never does, on either policy.
+reclaimPolicy: Delete
+
+allowVolumeExpansion: true
+
+parameters:
+  type: gp3
+  encrypted: "true"
+  {{- if .Values.storageClass.kmsKeyId }}
+  kmsKeyId: {{ .Values.storageClass.kmsKeyId | quote }}
+  {{- end }}
+{{- end }}

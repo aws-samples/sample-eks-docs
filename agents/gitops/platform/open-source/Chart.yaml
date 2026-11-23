@@ -1,0 +1,5 @@
+apiVersion: v2
+name: eks-agents-platform-open-source
+description: The platform's Argo CD Applications for the open-source path, rendered by the root Application (gitops/bootstrap/open-source/root-app.yaml).
+type: application
+version: 1.0.0

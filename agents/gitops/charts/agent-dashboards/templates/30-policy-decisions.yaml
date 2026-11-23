@@ -1,0 +1,134 @@
+{{- if .Values.policyDecisions.enabled }}
+{{- $ds := .Values.dashboard.datasource }}
+{{- $ns := .Values.namespaces.reasoning }}
+{{/*
+What each layer refused, in one view: the open source counterpart of the AWS services path's
+CloudWatch dashboard (the agents-observability page of the EKS User Guide). values.yaml,
+policyDecisions, says where each series comes from. All four are counters. The tables and totals
+read each counter's rise over the dashboard's range as `x - (x offset $__range or x * 0)`, not
+increase(): a series that first appears inside the range (the first refusal of a new agent, flow or
+policy) has no earlier sample, and increase() reports 0 for it, so a fresh denial reads 0.
+
+`scripts/exercise.sh --path open-source decisions` provokes one refusal at each layer and waits for
+each counter here to rise.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-policy-decisions-dashboard
+  namespace: {{ .Values.dashboard.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    {{ .Values.dashboard.sidecarLabel }}: "1"
+  annotations:
+    grafana_folder: {{ .Values.dashboard.folder | quote }}
+data:
+  agent-policy-decisions.json: |
+    {
+      "uid": {{ .Values.policyDecisions.uid | quote }},
+      "title": "Agents · policy decisions",
+      "tags": ["eks-agents", "policy"],
+      "timezone": "browser",
+      "refresh": {{ .Values.dashboard.refresh | quote }},
+      "time": { "from": "now-6h", "to": "now" },
+      "panels": [
+        {
+          "type": "stat",
+          "title": "Gateway refusals",
+          "description": "Requests the egress gateway refused: 401 (no valid agent token) and 403 (an agent on a route that is not its own).",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "targets": [{ "datasource": {{ $ds | quote }}, "refId": "A",
+            "expr": "sum((agentgateway_requests_total{status=~\"401|403\"} - (agentgateway_requests_total{status=~\"401|403\"} offset $__range or agentgateway_requests_total{status=~\"401|403\"} * 0)))" }]
+        },
+        {
+          "type": "stat",
+          "title": "Mesh refusals",
+          "description": "Connections an Istio AuthorizationPolicy refused at ztunnel.",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+          "targets": [{ "datasource": {{ $ds | quote }}, "refId": "A",
+            "expr": "sum((istio_tcp_connections_closed_total{reporter=\"destination\",response_flags=\"DENY\"} - (istio_tcp_connections_closed_total{reporter=\"destination\",response_flags=\"DENY\"} offset $__range or istio_tcp_connections_closed_total{reporter=\"destination\",response_flags=\"DENY\"} * 0)))" }]
+        },
+        {
+          "type": "stat",
+          "title": "Admission refusals",
+          "description": "Objects a ValidatingAdmissionPolicy refused, from the API server's own counter.",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+          "targets": [{ "datasource": {{ $ds | quote }}, "refId": "A",
+            "expr": "sum((apiserver_validating_admission_policy_check_total{enforcement_action=\"deny\"} - (apiserver_validating_admission_policy_check_total{enforcement_action=\"deny\"} offset $__range or apiserver_validating_admission_policy_check_total{enforcement_action=\"deny\"} * 0)))" }]
+        },
+        {
+          "type": "stat",
+          "title": "Network policy denials",
+          "description": "Flows the network policy refused on the agents' nodes.",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+          "targets": [{ "datasource": {{ $ds | quote }}, "refId": "A",
+            "expr": "sum((netpol_flow_denials_total - (netpol_flow_denials_total offset $__range or netpol_flow_denials_total * 0)))" }]
+        },
+        {
+          "type": "timeseries",
+          "title": "Refusals per minute, by layer",
+          "gridPos": { "h": 7, "w": 24, "x": 0, "y": 4 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            { "datasource": {{ $ds | quote }}, "refId": "A", "legendFormat": "gateway",
+              "expr": "sum(rate(agentgateway_requests_total{status=~\"401|403\"}[5m])) * 60" },
+            { "datasource": {{ $ds | quote }}, "refId": "B", "legendFormat": "mesh",
+              "expr": "sum(rate(istio_tcp_connections_closed_total{reporter=\"destination\",response_flags=\"DENY\"}[5m])) * 60" },
+            { "datasource": {{ $ds | quote }}, "refId": "C", "legendFormat": "admission",
+              "expr": "sum(rate(apiserver_validating_admission_policy_check_total{enforcement_action=\"deny\"}[5m])) * 60" },
+            { "datasource": {{ $ds | quote }}, "refId": "D", "legendFormat": "network policy",
+              "expr": "sum(rate(netpol_flow_denials_total[5m])) * 60" }
+          ]
+        },
+        {
+          "type": "table",
+          "title": "Gateway refusals, by agent and route",
+          "description": "agent is the caller's verified token subject, added by the gateway's request-metrics policy; unauthenticated means no valid token came.",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 11 },
+          "options": { "sortBy": [{ "displayName": "Value", "desc": true }] },
+          "targets": [{ "datasource": {{ $ds | quote }}, "refId": "A", "format": "table", "instant": true,
+            "expr": "sum by (agent, route, status) ((agentgateway_requests_total{status=~\"401|403\"} - (agentgateway_requests_total{status=~\"401|403\"} offset $__range or agentgateway_requests_total{status=~\"401|403\"} * 0))) > 0" }]
+        },
+        {
+          "type": "table",
+          "title": "Mesh refusals, by caller and destination",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 11 },
+          "targets": [{ "datasource": {{ $ds | quote }}, "refId": "A", "format": "table", "instant": true,
+            "expr": "sum by (source_workload_namespace, source_workload, source_principal, destination_workload_namespace, destination_workload) ((istio_tcp_connections_closed_total{reporter=\"destination\",response_flags=\"DENY\"} - (istio_tcp_connections_closed_total{reporter=\"destination\",response_flags=\"DENY\"} offset $__range or istio_tcp_connections_closed_total{reporter=\"destination\",response_flags=\"DENY\"} * 0))) > 0" }]
+        },
+        {
+          "type": "table",
+          "title": "Admission refusals, by policy",
+          "description": "The counter names the policy, not the object or user. For those, read the API server's audit log.",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+          "targets": [{ "datasource": {{ $ds | quote }}, "refId": "A", "format": "table", "instant": true,
+            "expr": "sum by (policy, policy_binding) ((apiserver_validating_admission_policy_check_total{enforcement_action=\"deny\"} - (apiserver_validating_admission_policy_check_total{enforcement_action=\"deny\"} offset $__range or apiserver_validating_admission_policy_check_total{enforcement_action=\"deny\"} * 0))) > 0" }]
+        },
+        {
+          "type": "table",
+          "title": "Network policy denials, by flow",
+          "description": "IP addresses, not pods: kubectl get pods -A -o wide --field-selector status.podIP=<src>, soon after, because addresses are reused. tier NETWORK_POLICY is a namespaced policy, ADMIN a cluster network policy, DEFAULT no policy matched.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+          "targets": [{ "datasource": {{ $ds | quote }}, "refId": "A", "format": "table", "instant": true,
+            "expr": "sum by (src, dst, dport, proto, direction, tier, node) ((netpol_flow_denials_total - (netpol_flow_denials_total offset $__range or netpol_flow_denials_total * 0))) > 0" }]
+        },
+        {
+          "type": "timeseries",
+          "title": "Network policy verdicts per minute, by tier",
+          "gridPos": { "h": 7, "w": 24, "x": 0, "y": 27 },
+          "targets": [{ "datasource": {{ $ds | quote }}, "refId": "A", "legendFormat": "{{ "{{verdict}} {{tier}}" }}",
+            "expr": "sum by (verdict, tier) (rate(netpol_flow_verdicts_total[5m])) * 60" }]
+        },
+        {
+          "type": "text",
+          "title": "What this dashboard does not show",
+          "gridPos": { "h": 5, "w": 24, "x": 0, "y": 34 },
+          "options": {
+            "mode": "markdown",
+            "content": "**Counts, not records.** This path has no log store, so the dashboard names who and where, not the request.\n\n**IAM refusals** are in CloudTrail (`errorCode` `AccessDenied`, the agent's role session), on both paths.\n\n**A sandboxed agent's own traffic is not carried by ztunnel**, so mesh refusals here are between unsandboxed workloads; the network policy is what decides for an agent.\n\n**MCP tool-policy refusals** show as a tool missing from the list and a 400 `unknown resource` on the call, which this dashboard does not separate from other bad requests. The MCP server's log names the agent and the person for each person-tool call."
+          }
+        }
+      ]
+    }
+{{- end }}

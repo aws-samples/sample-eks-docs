@@ -1,0 +1,79 @@
+# The root of the platform: the third bootstrap object, after cluster-secret.yaml and
+# appproject.yaml. Everything else on the cluster comes through this.
+#
+#   ./scripts/bootstrap-gitops.sh --path open-source
+#
+# Don't apply this template as it is: it carries placeholders. Terraform renders root-app.local.yaml
+# from it, and the script folds the rendered values files in before applying it, so there are no
+# ARNs to copy.
+#
+# Why an app-of-apps rather than one Application per component applied by hand: the set of platform
+# components is itself something to review and roll back. A component added by `kubectl apply` is a
+# component nobody can see the history of, and on a stack whose security properties come from the
+# mesh, the gateway and the admission policy all being present, "which of these is installed" has to
+# be answerable from Git.
+#
+# This Application is created with no automated sync on purpose. The first reconcile of a cluster's
+# whole platform is worth looking at before it happens; turn automation on in the child Applications
+# (they have it) and leave the root manual, so a change to the component set is a deliberate sync.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: eks-agents-platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  finalizers:
+    # Deleting this Application removes the children it created, which is what makes it an
+    # uninstall rather than an orphaning. Note what that means: deleting the root takes down the
+    # mesh, the gateway and the admission policy, so the agents keep running with none of the
+    # controls this stack exists to give them. Remove components deliberately in Git instead.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  # Names the AppProject this directory ships, rather than `default`, so the behaviour does not
+  # depend on how the Argo CD you point at this happens to have set `default` up.
+  #
+  # That is not a style preference. An Application in the `argocd` namespace is REFUSED under a
+  # project that does not opt that namespace in via `sourceNamespaces`:
+  #
+  #   application '<name>' in namespace 'argocd' is not permitted to use project 'default'
+  #
+  # and whether the capability's `default` project does is not a thing to rely on. Naming this
+  # repository's own project makes the opt-in explicit, and makes appproject.yaml the one reviewable
+  # place that says what this platform may install. Apply appproject.yaml first; see the order in
+  # cluster-secret.yaml.
+  project: eks-agents
+
+  # THE PLATFORM, FROM THIS REPOSITORY; THE ACCOUNT'S VALUES, FROM THIS OBJECT. The path is a Helm
+  # chart whose templates are the platform's Applications, one per component. Each reads its chart
+  # from the same repository and revision, so the cluster runs exactly the code at that revision.
+  # Everything specific to this stack (the account, the Region, the cluster, which layers are on)
+  # arrives in helm.values below and nowhere else, so nothing from the account is ever committed.
+  #
+  # Terraform renders this file's REPO_* placeholders and the excluded list. scripts/bootstrap-gitops.sh
+  # replaces the VALUES_FILES line with the values files Terraform wrote beside the platform chart
+  # (gitops/platform/open-source/*-values.yaml), so an edit to one of them, such as a release-gate case,
+  # reaches the cluster on the next sync without a commit.
+  source:
+    repoURL: REPO_URL
+    targetRevision: REPO_REVISION
+    path: REPO_PATHgitops/platform/open-source
+    helm:
+      values: |
+        repo:
+          url: REPO_URL
+          revision: REPO_REVISION
+          path: "REPO_PATH"
+        # A layer that is off is left out, not installed and made inert.
+        excluded: PLATFORM_EXCLUDED
+        # VALUES_FILES
+
+  destination:
+    name: eks-agents
+    namespace: argocd
+
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true

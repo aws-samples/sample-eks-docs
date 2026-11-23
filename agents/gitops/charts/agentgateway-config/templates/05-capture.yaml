@@ -1,0 +1,154 @@
+{{- if .Values.capture.enabled }}
+{{/*
+Transparent capture: how an agent's traffic reaches the gateway without the agent naming it.
+
+ONE OBJECT CAPTURES EVERY DESTINATION. The ServiceEntry below declares every IPv4 address on the
+captured port as a mesh service whose only endpoints are the gateway's pods. An agent resolves the
+real host and dials it; ztunnel matches the destination IP against this entry and tunnels the
+connection over HBONE to the gateway instead of sending it out. Destinations are NOT enumerated
+here: a new destination is a route at the gateway, and a captured request for a host no route lists
+gets a 404 there rather than leaving the cluster.
+
+It follows that the gateway, not the agent, controls DNS for egress. Whatever address the agent's
+lookup returned, the connection lands here and the gateway resolves the real upstream from its own
+configuration -- so a poisoned answer inside the agent's pod cannot move an approved request.
+
+THIS IS NOT A WAYPOINT. Annotating the Gateway `istio.io/waypoint-for: workload` selects a
+different mechanism and does not produce this behaviour: Istio provisions and programs waypoints for
+a waypoint-class Gateway, while policy on an agentgateway proxy comes from Gateway API rather than
+from Istio's own APIs. The shape here -- a mesh-internal ServiceEntry pointing at pods that
+terminate HBONE directly -- is the one that works.
+
+OFF BY DEFAULT, for two independent reasons, and the second one does not expire:
+
+  1. A pod under `runtimeClassName: isolated-sandbox` is not captured by ztunnel in either
+     direction, and every agent on this stack is sandboxed. So the ServiceEntry redirects nothing an
+     agent sends, turning this on buys nothing for agents, and the endpoint contract in the agent's
+     environment is what works. The agents-mesh page of the EKS User Guide has the
+     detail.
+
+  2. BLAST RADIUS. `addresses: 0.0.0.0/0` with `exportTo: ["*"]` is cluster-wide: it captures the
+     captured port for EVERY ambient-enrolled pod on the cluster, not only agents. On a cluster
+     running anything besides this stack, that redirects other people's traffic into the agent
+     egress gateway, where it matches no route and gets a 404. A reference implementation on a
+     single-purpose cluster can default this on; a template that lands on a shared cluster cannot.
+
+So enabling this is a deliberate act with a precondition to check first, which is why it is a value
+rather than a consequence of the mesh being on. To scope it rather than take the whole cluster, set
+`capture.exportToNamespaces` -- the ServiceEntry is then visible only to the namespaces listed, and
+every other workload's egress is untouched.
+
+THE EGRESS POLICIES NEED NO CHANGE FOR THIS, which is worth stating because the obvious worry is
+that they do. Under capture, the only thing that leaves an agent's pod is the HBONE hop: ztunnel's
+redirect is a local DNAT inside the pod's network namespace, so the external host never appears on
+the wire and a rule naming a hostname would permit a flow that does not exist. All three of this
+stack's egress rules for the gateway -- the cluster tier in gitops/base/templates/30-cluster-egress-policy.yaml,
+the namespaced one in gitops/base/templates/31-namespaced-egress-policy.yaml, and the per-agent one
+the agent resource definition composes -- name the gateway's NAMESPACE with no port restriction, so
+they cover the tunnel on 15008 and the addressed port equally. The hostname form that would have
+broken is used only on the AWS services path, where there is no capture and the gateway is genuinely
+off-cluster.
+
+Tightening those rules to the gateway's PODS on 15008 is available and is stricter, but it is only
+correct while capture is on: it refuses the addressed path, so it cannot be the default. Make that
+change at the same time as this value, not before.
+
+ZTUNNEL VERSION FLOOR, and getting this wrong is a silent failure rather than an error. The CIDR
+service lookup this depends on is broken in ztunnel 1.30.4 and 1.30.5, and in 1.31.0 and 1.31.1:
+the catch-all service is inserted with no endpoints and the empty snapshot wins, so the symptom is
+no healthy upstream while `ztunnel-config service` shows the correct entry. Fixed by
+istio/ztunnel#2086 and its backports (#2124 for release-1.30, #2156 for release-1.31); the pin,
+1.31.4, carries the fix.
+*/}}
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: egress-catchall
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  # Not a resolvable name. `hosts` is required and this value is never looked up by anything; the
+  # `addresses` block below is what ztunnel matches on.
+  hosts:
+    - internal-catchall
+
+  addresses:
+    - {{ .Values.capture.addresses | quote }}
+
+  # MESH_INTERNAL, because the endpoints are pods in this cluster carrying mesh identity. Marking it
+  # external would make ztunnel treat the gateway as an outside destination and skip the tunnel,
+  # which is the whole mechanism.
+  location: MESH_INTERNAL
+
+  # STATIC with a workloadSelector: the endpoints are whatever pods carry the gateway's label, so
+  # the entry follows the gateway's pods through a rollout without being updated.
+  resolution: STATIC
+
+  ports:
+    - name: tcp
+      number: {{ .Values.capture.port }}
+      protocol: TCP
+      targetPort: {{ .Values.capture.port }}
+
+  # THE ADMISSION WEBHOOK DOES NOT CHECK THIS, so a wrong label here is a runtime failure rather
+  # than a rejected apply. A MESH_INTERNAL, STATIC ServiceEntry with NO workloadSelector and no
+  # endpoints at all is accepted by server-side apply. The entry then
+  # resolves to nothing, every captured connection gets no healthy upstream, and the object reports
+  # no problem -- the same shape of failure as the ztunnel CIDR defect above, from a different
+  # cause.
+  #
+  # So confirm the selector matches real pods rather than trusting the apply:
+  #   kubectl -n {{ .Values.gateway.namespace }} get pods -l {{ range $k, $v := .Values.capture.gatewayPodLabels }}{{ $k }}={{ $v }}{{ end }}
+  workloadSelector:
+    labels:
+      {{- toYaml .Values.capture.gatewayPodLabels | nindent 6 }}
+
+  {{- if .Values.capture.exportToNamespaces }}
+  # Scoped: only these namespaces see the entry, so nothing else on the cluster is redirected.
+  exportTo:
+    {{- range .Values.capture.exportToNamespaces }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- else }}
+  # Cluster-wide. Every ambient-enrolled pod's traffic on the captured port is redirected here. Read
+  # the blast-radius note above before leaving it this way.
+  exportTo:
+    - "*"
+  {{- end }}
+---
+{{/*
+The gateway's pods have to accept HBONE directly, and be left out of the mesh themselves.
+
+Three labels, each load-bearing:
+
+  the app label                        what the ServiceEntry's workloadSelector matches
+  istio.io/dataplane-mode: none        keeps the gateway itself out of ambient. Without it the
+                                       gateway's own outbound calls to Bedrock and to third-party
+                                       hosts are captured by the ServiceEntry above and sent back to
+                                       itself
+  networking.istio.io/tunnel: http    tells ztunnel these pods terminate HBONE, so it tunnels to
+                                       them rather than treating them as a plain backend
+
+AgentgatewayParameters is how the controller is told what the provisioned Deployment looks like; the
+Gateway references it through `infrastructure.parametersRef`.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayParameters
+metadata:
+  name: {{ .Values.gateway.name }}
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  deployment:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- toYaml .Values.capture.gatewayPodLabels | nindent 12 }}
+            istio.io/dataplane-mode: none
+            networking.istio.io/tunnel: http
+{{- end }}

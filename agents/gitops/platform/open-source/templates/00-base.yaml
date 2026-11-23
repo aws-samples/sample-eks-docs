@@ -1,0 +1,84 @@
+{{- if not (has "00-base.yaml" .Values.excluded) }}
+# The shared cluster objects: namespaces, network policy enforcement, the admission policy, the
+# egress boundary, and the agent resource definition.
+#
+# Synced first through a negative sync wave. Order matters here more than it usually does in GitOps,
+# and in one direction specifically: the ConfigMap that turns on network policy enforcement has to
+# exist before the policies do, or they are accepted and silently ignored. A cluster where the
+# policies arrived first and the ConfigMap arrived later is not self-healing into a correct state
+# until something re-reconciles the policies.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: eks-agents-base
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+    # SERVER-SIDE DIFF, or this Application never reads Synced. The API server fills CRD schema
+    # defaults into the ingress objects (an HTTPRoute backendRef's weight: 1 and kind: Service,
+    # a listener's alpnPolicy: None, the OIDC rule's session cookie and timeout), and the client-side
+    # diff counts every one as drift -- so with ingress on, eks-agents-base sits OutOfSync
+    # permanently and a real drift is indistinguishable from the noise.
+    argocd.argoproj.io/compare-options: ServerSideDiff=true
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: {{ .Values.repo.url }}
+    targetRevision: {{ .Values.repo.revision }}
+    path: {{ .Values.repo.path }}gitops/base
+
+    helm:
+      valueFiles:
+        # The chart's own defaults. The rendered values below win over them, and they are what
+        # carries the account, the Region, the cluster name, the checkpoint bucket and the
+        # permissions boundary. Without them the chart refuses to render the agent resource
+        # definition rather than producing one that points at placeholders — see the fail guards at
+        # the top of templates/40-agent-rgd.yaml.
+        - values.yaml
+
+      # ignoreMissingValueFiles stays at its default, false, so a missing values file fails the
+      # render. Not written out: the EKS Argo CD capability rewrites Application objects and drops
+      # a false field, so the root Application would compare Git's false with nothing and stay
+      # OutOfSync.
+      # The rendered values (terraform), passed by the root Application.
+      values: |
+        {{- toYaml .Values.terraform | nindent 8 }}
+  destination:
+    name: eks-agents
+    namespace: kube-system
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: true
+      # selfHeal matters more here than anywhere else on the cluster. These are the objects whose
+      # removal is silent: a deleted ClusterNetworkPolicy does not stop an agent, it just stops
+      # refusing anything.
+      selfHeal: true
+
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true
+      # No Application-wide PruneLast: with it every prune runs in one step, and turning ingress off
+      # would delete the Gateway's class and load balancer configuration with it, which deadlocks the
+      # load balancer's deletion. Without it Argo CD prunes in reverse wave order and waits between
+      # waves (45-agent-gateway-api.yaml). The network, admission and mesh policies still carry
+      # PruneLast themselves, so a policy is never removed before its replacement is applied.
+{{- end }}

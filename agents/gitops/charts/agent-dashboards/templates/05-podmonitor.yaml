@@ -1,0 +1,61 @@
+{{- if .Values.gateway.enabled }}
+{{/*
+Scrape the gateway's data plane, which is where every per-model figure and every dollar comes from.
+
+A PodMonitor rather than a ServiceMonitor, and that is not a style choice. The gateway's data plane
+serves its metrics on port 15020, and the Service the gateway's controller creates publishes only
+the listener port:
+
+  kubectl -n agentgateway-system get svc egress \
+    -o jsonpath='{range .spec.ports[*]}{.name}={.port} {end}'
+  -> listener-8080=8080
+
+So a ServiceMonitor has no port to name. Add the port to the Service and a ServiceMonitor would
+work too, but the Service is the controller's object and editing it loses the edit on reconcile.
+
+WHAT IS LOST WITHOUT THIS. Not an error anywhere: the gateway keeps emitting, Prometheus keeps
+scraping what it does know about, and the per-model and spend panels of the dashboard are simply
+empty. Nothing in the cluster reports a fault. Confirm the target exists after installing:
+
+  kubectl -n monitoring get podmonitor agent-gateway-genai
+  kubectl -n monitoring exec prometheus-kube-prometheus-stack-prometheus-0 -c prometheus -- \
+    wget -qO- localhost:9090/api/v1/targets | grep -c agent-gateway-genai
+
+ONLY THE OPEN SOURCE PATH HAS THIS. AgentCore Gateway is managed and exposes no in-cluster metrics
+endpoint, so on the AWS services path set gateway.enabled=false and expect the per-model panels to
+stay empty; its equivalents are CloudWatch metrics on the gateway and the Cost and Usage Report.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: agent-gateway-genai
+  namespace: {{ .Values.dashboard.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.gateway.namespace }}
+  selector:
+    matchLabels:
+      {{- toYaml .Values.gateway.podSelector | nindent 6 }}
+  podMetricsEndpoints:
+    # By port NAME, which the gateway's container declares:
+    #
+    #   kubectl -n agentgateway-system get pod -l gateway.networking.k8s.io/gateway-name=egress \
+    #     -o jsonpath='{range .items[0].spec.containers[*]}{range .ports[*]}{.name}={.containerPort} {end}{end}'
+    #   -> metrics=15020
+    #
+    # `targetPort` with the number also renders, and the operator then logs
+    # "'targetPort' is deprecated, use 'port' or 'portNumber' instead" and produced no active
+    # target here. The warning is in the operator's log, not on the PodMonitor, so the only visible
+    # symptom is empty panels.
+    - port: {{ .Values.gateway.metricsPortName }}
+      path: /metrics
+      interval: {{ .Values.gateway.interval }}
+      # Keep the labels the gateway produced. Without this Prometheus would overwrite them with
+      # the scrape target's own, and the model and route labels every per-model panel groups on
+      # would be replaced by the pod's.
+      honorLabels: true
+{{- end }}

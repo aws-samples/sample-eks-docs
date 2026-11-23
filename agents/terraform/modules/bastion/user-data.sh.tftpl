@@ -1,0 +1,95 @@
+#!/bin/bash
+# Bastion bootstrap. Everything here is idempotent, because user_data_replace_on_change means this
+# runs again on a fresh instance whenever it changes.
+set -euxo pipefail
+
+dnf install -y git tar gzip jq docker
+
+# A container builder, because the README's last deployment step is building and pushing the agent
+# images and this host is the only place inside the VPC that can reach both ECR and the cluster.
+systemctl enable --now docker
+
+# kubectl and helm name architectures the Go way; the AMI alias names them the AWS way.
+ARCH=${architecture == "x86_64" ? "amd64" : "arm64"}
+
+curl -sSLo /usr/local/bin/kubectl \
+  "https://dl.k8s.io/release/${kubectl_version}/bin/linux/$ARCH/kubectl"
+chmod +x /usr/local/bin/kubectl
+
+curl -sSL https://get.helm.sh/helm-v3.16.3-linux-$ARCH.tar.gz -o /tmp/helm.tgz
+tar -xzf /tmp/helm.tgz -C /tmp
+install -m 0755 /tmp/linux-$ARCH/helm /usr/local/bin/helm
+rm -rf /tmp/helm.tgz /tmp/linux-$ARCH
+
+# KUBECONFIG HAS TO BE EXPLICIT.
+#
+# SSM runs commands without HOME set, so kubectl does not find ~/.kube/config -- it falls back to
+# localhost:8080 and reports a connection refused that reads exactly like the API server being
+# unreachable, on a host where the API server is in fact reachable. Writing it into /etc/profile.d
+# fixes it for an interactive `ssm start-session`, and the file below is for `ssm send-command`,
+# which does not read profile scripts either.
+aws eks update-kubeconfig --region ${region} --name ${cluster_name} --kubeconfig /root/.kube/config
+
+# THE INSTANCE PROFILE, NOT SSM AGENT'S ROLE. With Default Host Management Configuration on in the
+# account, SSM Agent can start sessions and commands with AWS_SHARED_CREDENTIALS_FILE pointing at the
+# credentials of its own role. The CLI reads that file before the instance profile, so kubectl would
+# authenticate as a role with no access entry and get 401. Both files below unset it.
+cat > /etc/profile.d/kubeconfig.sh <<'PROFILE'
+export KUBECONFIG=/root/.kube/config
+unset AWS_SHARED_CREDENTIALS_FILE
+PROFILE
+chmod 0644 /etc/profile.d/kubeconfig.sh
+
+# For `aws ssm send-command`, which runs neither a login shell nor profile scripts. Prefix any
+# non-interactive command with this, or set KUBECONFIG inline:
+#   aws ssm send-command ... --parameters 'commands=["source /etc/bastion-env && kubectl get nodes"]'
+cat > /etc/bastion-env <<'ENVFILE'
+export KUBECONFIG=/root/.kube/config
+export AWS_REGION=${region}
+export HOME=/root
+unset AWS_SHARED_CREDENTIALS_FILE
+ENVFILE
+chmod 0644 /etc/bastion-env
+
+# THE REPOSITORY, BECAUSE EVERY kubectl STEP APPLIES SOMETHING FROM IT.
+#
+# The API endpoint is private, so the documented place to run kubectl is this host -- and the things
+# to apply all live in the repository: the bootstrap objects, scripts/install-platform.sh, the
+# examples. A bastion without the repository turns "run this command here" into "and first get the
+# tree onto the host", which is a manual step nobody wrote down.
+#
+# NON-FATAL ON PURPOSE. The URL may be unreachable from the VPC, or private and needing a credential
+# this host deliberately does not hold. Either way the host still has to come up: it is also how you
+# reach a cluster whose GitOps you are not using. The outcome is written where the bootstrap log
+# already points, so a missing clone is a line you read rather than a boot you debug.
+if [ -n "${gitops_repo_url}" ]; then
+  # A CODECOMMIT URL NEEDS GIT'S CREDENTIAL HELPER, not only the IAM grant. main.tf gives this host's
+  # role codecommit:GitPull on the repositories named in gitops_codecommit_repository_arns, but git
+  # over HTTPS knows nothing of IAM: without the helper the clone fails with
+  #   fatal: could not read Username for 'https://git-codecommit.<region>.amazonaws.com'
+  # --system, because cloud-init runs with no HOME for --global to write into.
+  case "${gitops_repo_url}" in
+    https://git-codecommit.*.amazonaws.com/*)
+      git config --system credential.helper '!aws codecommit credential-helper $@'
+      git config --system credential.UseHttpPath true
+      ;;
+  esac
+  if git clone --depth 1 "${gitops_repo_url}" /opt/eks-agents >/var/log/bastion-clone.log 2>&1; then
+    echo "repository cloned to /opt/eks-agents" >> /var/log/bastion-clone.log
+    echo 'cd /opt/eks-agents' >> /etc/profile.d/kubeconfig.sh
+  else
+    {
+      echo
+      echo "CLONE FAILED. This host has no copy of the repository, so the kubectl steps in the"
+      echo "README have nothing to apply. Either clone it yourself:"
+      echo "    git clone <your fork> /opt/eks-agents"
+      echo "or copy the tree up. If the repository is private, this host holds no credential for"
+      echo "it by design -- give it one deliberately rather than widening its role."
+    } >> /var/log/bastion-clone.log
+  fi
+fi
+
+# A marker the module's output tells you to check, so "is it ready" has an answer that is not
+# "try kubectl and see".
+kubectl version --output=json > /var/log/bastion-ready.json 2>&1 || true
+touch /var/log/bastion-bootstrap-complete

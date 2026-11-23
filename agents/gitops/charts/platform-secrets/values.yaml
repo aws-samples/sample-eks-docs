@@ -1,0 +1,57 @@
+# Projects the platform's generated secrets from AWS Secrets Manager into the Kubernetes Secrets that
+# third-party charts read.
+#
+# READ THIS BEFORE CHANGING ANYTHING HERE. Five components on this path read an `existingSecret`
+# that nothing created: valkey's auth, Grafana's admin and Langfuse's three. Terraform generates the
+# values into Secrets Manager; the Secrets Store CSI driver projects them; and because every
+# consumer is a third-party chart that cannot be given a volume, the projection has to produce a real
+# Kubernetes Secret rather than a mounted file. `secretObjects` does that, and a synced Secret lives
+# only while a pod mounts its SecretProviderClass -- which is what templates/syncer.yaml is for.
+
+platformSecrets:
+  # Rendered false until Terraform has run: the SecretProviderClass objects name Secrets Manager
+  # secrets by name, and a class naming a secret that does not exist fails the mount rather than the
+  # render, which is a failure you find at pod start.
+  enabled: false
+
+  # Which namespaces get a syncer. Derived from the secrets below; listed so a namespace with no
+  # secrets gets no pod.
+  namespaces:
+    - agent-memory
+    - monitoring
+    - langfuse
+
+  # Create the namespaces the syncers land in. This chart runs BEFORE the components that own them
+  # -- that is the point of it -- so it cannot wait for their Applications. See
+  # templates/00-namespaces.yaml for why this does not fight Helm or Argo CD for ownership.
+  createNamespaces: true
+
+  # How the provider authenticates to Secrets Manager. "true" selects EKS Pod Identity, which is what
+  # Terraform creates an association for and what every other AWS identity in this stack uses.
+  # Omitted or "false" means IRSA, which needs an eks.amazonaws.com/role-arn annotation on the
+  # service account and an OIDC trust policy on the role -- neither of which this stack creates.
+  usePodIdentity: "true"
+
+  serviceAccountName: platform-secrets
+
+  # Nothing but a process that sleeps. Pinned to a version tag rather than latest, because this pod
+  # holding the mount is what keeps the synced Secrets the platform depends on in existence. A tag
+  # is not a digest: append @sha256:<digest> to pin the image's exact bytes.
+  pauseImage: registry.k8s.io/pause:3.10
+
+  # One entry per Kubernetes Secret: its namespace, its Secrets Manager name and its keys, ALL written
+  # by Terraform (terraform/modules/platform-secrets, output chart_values). Empty here so the chart
+  # cannot disagree with the module about which secrets exist or what keys they carry -- the open
+  # source path's five component secrets and, with ingress_idp = "oidc-direct", ingress's
+  # `ingress-oidc` on either path. Shape of one entry:
+  #
+  #   valkey-auth:
+  #     namespace: agent-memory
+  #     secretsManagerName: <cluster>/platform/valkey-auth
+  #     keys: ["password"]
+  secrets: {}
+
+  # Namespaces this chart must NOT create, because another chart owns them. The base chart creates
+  # the ingress namespace (its routes need it whether or not a secret is synced there), and two
+  # owners of one Namespace object is the ownership-metadata failure 00-namespaces.yaml describes.
+  externallyOwnedNamespaces: []

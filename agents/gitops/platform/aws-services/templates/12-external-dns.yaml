@@ -1,0 +1,83 @@
+{{- if not (has "12-external-dns.yaml" .Values.excluded) }}
+# The controller that writes the agents' DNS records.
+#
+# WHY A CONTROLLER RATHER THAN TERRAFORM. An agent's name resolves to the ingress load
+# balancer, and that load balancer does not exist when `terraform apply` runs: it is created by the
+# EKS Auto Mode ALB controller when the Gateway below syncs, and it is recreated with a new address
+# whenever the Gateway is. Terraform can make the zone -- and does, in terraform/modules/ingress
+# -- but a record written once goes stale the first time the Gateway is replaced, and the symptom is
+# a hostname resolving to a load balancer that has been deleted.
+#
+# WHAT IT IS ALLOWED TO DO. `route53:ChangeResourceRecordSets` on ONE zone: the private zone the
+# ingress module created for the agents' domain. Not the public zone that answered the
+# certificate challenge, and no other zone in the account. The role is in the module; this
+# Application only names it.
+#
+# WHY `gateway-httproute` AND NOT `service`. The address belongs to the Gateway and the hostnames
+# belong to the HTTPRoutes, so this source reads both and writes one record per route hostname. A
+# `service` source would see the Gateway's Service and have no hostname to write.
+#
+# Skipped entirely where ingress is off: with no zone and no role there is nothing for it to
+# reconcile, and a controller that cannot authenticate logs an access denial every minute.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: external-dns
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    # After the CRDs and the base chart, because it watches Gateway API objects: starting before the
+    # CRDs exist leaves it crash-looping on a watch for a kind the API server does not know.
+    argocd.argoproj.io/sync-wave: "-5"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  # THE CHART FROM ITS HELM REPOSITORY, ITS VALUES FROM THE ROOT APPLICATION.
+  #
+  # The zone id, the domain and the role are Terraform's outputs, so they are not typed into a
+  # valuesObject here: Terraform writes them to external-dns-values.yaml, and the root Application
+  # passes them in as helm.values (externalDns), so nothing account-specific is in Git.
+  sources:
+    - repoURL: https://kubernetes-sigs.github.io/external-dns/
+      chart: external-dns
+      # Pinned. An unpinned chart resolves to whatever is latest at sync time, which on a controller
+      # holding write access to a hosted zone is not a change to take by surprise.
+      targetRevision: 1.15.2
+
+      helm:
+        releaseName: external-dns
+        # ignoreMissingValueFiles stays at its default, false, so a missing values file fails the
+        # render. Not written out: the EKS Argo CD capability rewrites Application objects and drops
+        # a false field, so an Application that sets it compares Git's false with nothing and stays
+        # OutOfSync.
+        # The rendered values (externalDns), passed by the root Application.
+        values: |
+          {{- toYaml .Values.externalDns | nindent 10 }}
+  destination:
+    name: eks-agents
+    namespace: external-dns
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, several Applications
+    # can each spend minutes retrying with backoff that grows to minutes, and a chart that syncs
+    # in seconds waits behind them. Capped at 30 s, a transient failure costs seconds; the
+    # higher limit keeps the total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+{{- end }}

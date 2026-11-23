@@ -1,0 +1,16 @@
+apiVersion: v2
+name: adot-collector
+description: >-
+  The ADOT collector for agents on the AWS services path, as an OpenTelemetryCollector the
+  OpenTelemetry Operator reconciles, plus the service account the Pod Identity association delivers
+  its role to.
+
+  Separate from the operator's own chart so the pipeline — which is configuration a platform team
+  iterates on — is separable from the operator's version, which is not.
+type: application
+
+version: 0.1.0
+appVersion: "0.1.0"
+
+annotations:
+  eks-agents/paved-path: aws-services

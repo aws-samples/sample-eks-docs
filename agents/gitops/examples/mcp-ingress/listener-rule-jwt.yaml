@@ -1,0 +1,62 @@
+# The ingress gate for an MCP client, attached to one agent's route.
+#
+# An MCP client is a program, not a person at a browser, so the gate is `jwt-validation`: the load
+# balancer checks the bearer token the client sends and refuses the request with a 401 if it does
+# not verify. A browser flow (`authenticate-cognito`) would answer the same client with a 302 to a
+# login page it cannot follow. For a person, use the Agent resource's `routeAuth: browser` instead,
+# which renders the Cognito action from the platform's chart.
+#
+# This is the hand-written form of what the Agent resource composes with `routeAuth: workload`.
+#
+# Needs the AWS Gateway API extension CRDs (gateway.k8s.aws/v1), which the base chart installs with
+# ingress (gitops/base/templates/44-aws-gateway-api-crds.yaml). Without them this object cannot be
+# applied at all.
+apiVersion: gateway.k8s.aws/v1
+kind: ListenerRuleConfiguration
+metadata:
+  name: research
+  namespace: agents
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  # THE ATTACHMENT RUNS FROM THE ROUTE TO THIS OBJECT, so there is no reference here.
+  #
+  # `ListenerRuleConfiguration` has no `targetRef` field in any released version of the CRD -- its
+  # spec is `actions`, `conditions`, `tags`, across v2.13 through v3.6. The HTTPRoute attaches this
+  # object with an ExtensionRef filter instead; see httproute.yaml.
+  #
+  # Do not add a reference here, because the failure is silent and unsafe. An unknown field in a
+  # structural schema is PRUNED by the API server rather than rejected, so a `targetRef` written
+  # here disappears on apply and leaves this rule attached to nothing -- in front of a load balancer
+  # that still routes to the agent. Verify the gate by asserting a refusal, never by reading these
+  # objects.
+
+  actions:
+    - type: jwt-validation
+      jwtValidationConfig:
+        # Whoever issues the client's token. For an MCP client running as a pod in this cluster,
+        # that is the cluster's own OIDC issuer and the token is the pod's projected service
+        # account token. For a client elsewhere, it is that client's identity provider.
+        issuer: https://oidc.eks.us-west-2.amazonaws.com/id/EXAMPLE
+        # The load balancer fetches this over the internet, so an issuer reachable only inside the
+        # VPC does not work here. For the cluster issuer it is the issuer plus /keys.
+        jwksEndpoint: https://oidc.eks.us-west-2.amazonaws.com/id/EXAMPLE/keys
+
+        # NAME BOTH CLAIMS. jwt-validation checks the signature and the claims listed here, and
+        # nothing else. With only `sub` named, a token for the right service account minted for an
+        # unrelated audience reaches the agent; naming `aud` as well refuses it with 401 at the
+        # load balancer.
+        additionalClaims:
+          # Who may call: the client's identity, not merely "anyone this issuer signed for".
+          - name: sub
+            format: single-string
+            values:
+              - system:serviceaccount:mcp-clients:research-client
+          # What the token was minted for: this agent, so a token the client holds for another
+          # relying party is not accepted here.
+          - name: aud
+            # string-array, because a projected token's `aud` is a list even with one entry.
+            format: string-array
+            values:
+              - research

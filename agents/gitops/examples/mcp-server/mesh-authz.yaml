@@ -1,0 +1,58 @@
+# THE MESH HALF OF THIS EXAMPLE, separate because it only exists with a mesh.
+#
+# Apply it with mcp-server.yaml when mesh_mode is "ambient". With mesh_mode "none" there is no
+# AuthorizationPolicy kind on the cluster, and bundling it into mcp-server.yaml would make that whole
+# apply fail with `no matches for kind "AuthorizationPolicy"` after the other objects had been
+# created.
+---
+# AN ALLOW POLICY ON THE SERVER, WHICH MAKES IT DENY-BY-DEFAULT. Once an ALLOW policy selects a
+# workload, Istio refuses every connection to it that no ALLOW rule admits, so this one policy both
+# admits the gateway and refuses everything else that reaches the server over the mesh. (A
+# catch-all DENY would instead win over every ALLOW; see gitops/base/templates/50-mesh-authz.yaml.)
+#
+# WHAT A REFUSED GATEWAY LOOKS LIKE, with the Service's appProtocol correct (mcp-server.yaml): the
+# gateway resolves the target correctly and then times out dialling it --
+#
+#   http.status=500 mcp.method.name=initialize duration=10003ms
+#   error="mcp: failed to send message: http upstream error: http request failed: upstream call timeout"
+#
+# -- while the server's own log shows only `GET /healthz` from 127.0.0.1. The kubelet's exec probe
+# runs inside the container and never crosses ztunnel, so the pod looks perfectly healthy from
+# every angle: Ready, 2/2 endpoints serving, and no inbound request to refuse. A dropped connection
+# and a server that is simply not listening are indistinguishable from the caller's side.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: mcp-server-allow-gateway
+  namespace: mcp-servers   # mcp-namespace
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  # Scoped to this server's pods, not the namespace. A namespace-wide ALLOW would make every
+  # workload in the namespace deny-by-default at once, the shape
+  # gitops/base/templates/50-mesh-authz.yaml warns about for the gateway's own namespace.
+  selector:
+    matchLabels:
+      app: mcp-server
+
+  action: ALLOW
+  rules:
+    # The gateway is the ONLY permitted caller. Agents do not reach this server directly: they call
+    # the gateway's /mcp route, which is where the tool-level policy in
+    # gitops/charts/agentgateway-config is evaluated. Allowing agents here as well would let a
+    # compromised agent call tools with that policy bypassed entirely.
+    #
+    # Principal, not namespace: `<trustDomain>/ns/<ns>/sa/<sa>`, and NO spiffe:// prefix. With the
+    # prefix this rule matches nothing and the gateway is refused with "allow policies exist, but
+    # none allowed". The gateway's
+    # ServiceAccount is `egress` in `agentgateway-system`, and the trust domain is `cluster.local`
+    # unless mesh.trustDomain was changed in gitops/base/values.yaml, in which case change it here
+    # too: a stale trust domain denies silently.
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/agentgateway-system/sa/egress
+      to:
+        - operation:
+            ports: ["8080"]

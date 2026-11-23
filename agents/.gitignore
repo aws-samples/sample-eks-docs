@@ -1,0 +1,45 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+
+# Your own tfvars. Two are committed and carry placeholders only -- minimal.tfvars is the smallest
+# configuration that works and example.tfvars is every option annotated. A real one names your
+# account and your network, so it stays out.
+*.tfvars
+!example.tfvars
+!minimal.tfvars
+
+# The files the EKS User Guide has you save in the repository root. They name your account (an
+# Agent's image and model ARNs, a repository URL), and nothing reads them from Git.
+/my-agent.yaml
+/chat.sh
+/agents-app.yaml
+/reporter.yaml
+/session-claim.yaml
+/check-github.py
+# The generated certificate the ingress page saves from the Terraform root for --cacert.
+ca.pem
+
+# Local kubeconfigs and rendered output
+kubeconfig*
+*.local.yaml
+
+# NOT IGNORED: gitops/platform/<path>/*-values.yaml. The committed copies are placeholders that show
+# each file's shape, so the charts render in scripts/validate.sh before any apply. `terraform apply`
+# overwrites terraform-values.yaml (and the collector and external-dns files) with your account id,
+# OIDC issuer, ECR hosts and cluster name, and scripts/bootstrap-gitops.sh passes them to the cluster
+# in the root Application. They go to no repository: restore the placeholders with `git checkout`
+# before you commit, and scripts/validate.sh fails if an account value reaches the tree.
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+ingress-test-user.env
+*.tmp.sh

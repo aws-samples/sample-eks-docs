@@ -1,0 +1,349 @@
+{{/*
+The out-of-box agent dashboard.
+
+Picked up by the Grafana sidecar in kube-prometheus-stack, which watches every namespace for the
+label below -- so this ConfigMap does not have to live in Grafana's namespace, though it does.
+
+Templated rather than a static JSON file because the metric and label names are values: one place
+to correct them, in values.yaml. A dashboard with the wrong names renders empty rather than wrong,
+which is the better failure and still a failure.
+
+TWO SOURCES, ONE DASHBOARD, and which panel reads which is the thing to understand here:
+
+  the gateway   every per-model figure and every dollar. Its series carry gen_ai_request_model,
+                gen_ai_token_type and route -- and route is the per-agent dimension, because there
+                is no agent label. Open source path only.
+  the agent     its own event loop. No model label exists on these, so nothing keyed on a model can
+                come from here.
+
+WHAT IS DELIBERATELY NOT HERE, so its absence is not read as an oversight:
+
+  Refusals: network policy, mesh, gateway and admission. They are on the policy decisions
+  dashboard (30-policy-decisions.yaml).
+
+  Tool-call outcomes and trajectories. Those are spans, not metrics. They are in whatever trace
+  backend the path uses -- Langfuse here -- and a Prometheus dashboard cannot show them.
+*/}}
+{{- $g := .Values.gateway }}
+{{- $gl := .Values.gateway.labels }}
+{{- $am := .Values.agentMetrics }}
+{{- $al := .Values.agentMetrics.labels }}
+{{- $ds := .Values.dashboard.datasource }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-overview-dashboard
+  namespace: {{ .Values.dashboard.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    {{ .Values.dashboard.sidecarLabel }}: "1"
+  annotations:
+    # Which Grafana folder the sidecar files it under.
+    grafana_folder: {{ .Values.dashboard.folder | quote }}
+data:
+  agent-overview.json: |
+    {
+      "uid": {{ .Values.dashboard.uid | quote }},
+      "title": "Agents · overview",
+      "tags": ["eks-agents", "genai"],
+      "timezone": "browser",
+      "refresh": {{ .Values.dashboard.refresh | quote }},
+      "time": { "from": "now-6h", "to": "now" },
+      "templating": {
+        "list": [
+          {
+            "name": "agent",
+            "label": "Agent",
+            "type": "query",
+            "datasource": {{ $ds | quote }},
+            "query": "label_values(agent:tokens:rate5m, agent)",
+            "includeAll": true,
+            "multi": true,
+            "refresh": 2
+          },
+          {
+            "name": "model",
+            "label": "Model",
+            "type": "query",
+            "datasource": {{ $ds | quote }},
+            "query": "label_values({{ $g.metrics.tokens }}_sum, {{ $gl.requestModel }})",
+            "includeAll": true,
+            "multi": true,
+            "refresh": 2
+          }
+        ]
+      },
+      "panels": [
+        {
+          "type": "row",
+          "title": "Spend",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+        },
+        {
+          "type": "stat",
+          "title": "Spend, last 6h",
+          "description": "Dollars the gateway itself resolved from its model cost catalogue. Not an estimate from a price table, and not the invoice either -- the Cost and Usage Report is authoritative, keyed on the agent session tag.",
+          "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+          "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4 } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "sum(increase({{ $g.metrics.cost }}[6h]))",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "gauge",
+          "title": "Prices resolved exactly",
+          "description": "The share of calls the gateway found an exact price for. Below 1 the spend panels understate, and nothing else here would show it.",
+          "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "orange", "value": 0.95 },
+                  { "color": "green", "value": 0.999 }
+                ]
+              }
+            }
+          },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "gateway:cost_catalog_exact:ratio5m",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Spend per hour, by agent",
+          "description": "The per-agent dimension is extracted from the route label, which is one HTTPRoute per agent on the open source path. An agent with tokens below but no spend here has no priced call yet.",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 1 },
+          "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "agent:cost_usd_per_hour{agent=~\"$agent\"}",
+              "legendFormat": "{{ "{{agent}}" }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Spend per hour, by model",
+          "description": "Grouped on the request model. gen_ai_response_model is frequently \"unknown\", so grouping on it would split one model's series in two and halve every figure.",
+          "gridPos": { "h": 7, "w": 12, "x": 0, "y": 6 },
+          "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "model:cost_usd_per_hour",
+              "legendFormat": "{{ printf "{{%s}}" $gl.requestModel }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Spend per hour, by agent and model",
+          "description": "Which model an agent's spend is going to. Needs the model dimension the gateway's own metrics carry.",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 8 },
+          "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "agent_model:cost_usd:rate5m{agent=~\"$agent\"} * 3600",
+              "legendFormat": "{{ printf "{{agent}} · {{%s}}" $gl.requestModel }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "row",
+          "title": "Tokens",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }
+        },
+        {
+          "type": "timeseries",
+          "title": "Tokens per second, by agent and type",
+          "description": "gen_ai_token_type separates input, output, input_cache_read and input_cache_write. The cache types are what make a prompt-caching change visible.",
+          "gridPos": { "h": 7, "w": 12, "x": 0, "y": 16 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "agent:tokens:rate5m{agent=~\"$agent\"}",
+              "legendFormat": "{{ printf "{{agent}} · {{%s}}" $gl.tokenType }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Tokens per second, by model and type",
+          "gridPos": { "h": 7, "w": 12, "x": 12, "y": 16 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "model:tokens:rate5m{ {{ $gl.requestModel }}=~\"$model\" }",
+              "legendFormat": "{{ printf "{{%s}} · {{%s}}" $gl.requestModel $gl.tokenType }}",
+              "refId": "A"
+            }
+          ]
+        },
+{{- if .Values.budgets.enabled }}
+        {
+          "type": "bargauge",
+          "title": "Hourly token budget used, by agent",
+          "description": "Consumption against a number copied from the gateway's own token-budget policy. If the two drift, this panel is the wrong one -- the gateway enforces, this only reports.",
+          "gridPos": { "h": 6, "w": 24, "x": 0, "y": 23 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "orange", "value": 0.75 },
+                  { "color": "red", "value": 0.9 }
+                ]
+              }
+            }
+          },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "sum by (agent) (agent:tokens:rate5m) * 3600 / {{ .Values.budgets.defaultTokensPerHour }}",
+              "legendFormat": "{{ "{{agent}}" }}",
+              "refId": "A"
+            }
+          ]
+        },
+{{- end }}
+        {
+          "type": "row",
+          "title": "Latency, as the gateway sees it",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 29 }
+        },
+        {
+          "type": "timeseries",
+          "title": "Model call rate, by agent",
+          "gridPos": { "h": 7, "w": 8, "x": 0, "y": 30 },
+          "fieldConfig": { "defaults": { "unit": "reqps" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "sum by (agent) (label_replace(rate({{ $g.metrics.requestDuration }}_count[5m]), \"agent\", \"$1\", \"{{ $gl.route }}\", \"{{ $g.routePattern }}\"))",
+              "legendFormat": "{{ "{{agent}}" }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Request duration p95, by model",
+          "description": "Server-side, in seconds. The whole call including the model's own generation time, which is why a slow model shows here and not in the agent's loop panels.",
+          "gridPos": { "h": 7, "w": 8, "x": 8, "y": 30 },
+          "fieldConfig": { "defaults": { "unit": "s" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "histogram_quantile(0.95, sum by (le, {{ $gl.requestModel }}) (rate({{ $g.metrics.requestDuration }}_bucket{ {{ $gl.requestModel }}=~\"$model\" }[5m])))",
+              "legendFormat": "{{ printf "{{%s}}" $gl.requestModel }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Time to first token p95, by model",
+          "description": "What a streaming client waits before anything appears. This is the number the load balancer's idle timeout interacts with.",
+          "gridPos": { "h": 7, "w": 8, "x": 16, "y": 30 },
+          "fieldConfig": { "defaults": { "unit": "s" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "histogram_quantile(0.95, sum by (le, {{ $gl.requestModel }}) (rate({{ $g.metrics.timeToFirstToken }}_bucket{ {{ $gl.requestModel }}=~\"$model\" }[5m])))",
+              "legendFormat": "{{ printf "{{%s}}" $gl.requestModel }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "row",
+          "title": "The agent's own loop, and its pods",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 37 }
+        },
+        {
+          "type": "timeseries",
+          "title": "Event loop cycle duration p95, by agent",
+          "description": "From the Strands SDK, by way of the collector. The gateway cannot see this: it measures one model call, and a turn is many calls plus tool work.",
+          "gridPos": { "h": 7, "w": 8, "x": 0, "y": 38 },
+          "fieldConfig": { "defaults": { "unit": "s" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "histogram_quantile(0.95, sum by (le, {{ $al.agent }}) (rate({{ $am.cycleDuration }}_bucket[5m])))",
+              "legendFormat": "{{ printf "{{%s}}" $al.agent }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Agent-reported turn latency, p50 and p95",
+          "gridPos": { "h": 7, "w": 8, "x": 8, "y": 38 },
+          "fieldConfig": { "defaults": { "unit": "ms" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "histogram_quantile(0.50, sum by (le, {{ $al.agent }}) (rate({{ $am.latency }}_bucket[5m])))",
+              "legendFormat": "{{ printf "p50 {{%s}}" $al.agent }}",
+              "refId": "A"
+            },
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "histogram_quantile(0.95, sum by (le, {{ $al.agent }}) (rate({{ $am.latency }}_bucket[5m])))",
+              "legendFormat": "{{ printf "p95 {{%s}}" $al.agent }}",
+              "refId": "B"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Agent pod restarts, last hour",
+          "description": "A sandboxed agent that cannot pass its readiness probe shows up here. Use exec probes: an httpGet probe does not work for a pod in a Nitro sandbox.",
+          "gridPos": { "h": 7, "w": 8, "x": 16, "y": 38 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            {
+              "datasource": {{ $ds | quote }},
+              "expr": "sum by (pod) (increase(kube_pod_container_status_restarts_total{namespace=\"{{ .Values.namespaces.reasoning }}\"}[1h]))",
+              "legendFormat": "{{ "{{pod}}" }}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "title": "What this dashboard cannot show",
+          "gridPos": { "h": 6, "w": 24, "x": 0, "y": 45 },
+          "options": {
+            "mode": "markdown",
+            "content": "**Dollars come from the gateway**, which prices each call against its own model cost catalogue — there is no price table in this chart. Watch *Prices resolved exactly*: below 1, the spend panels understate. The Cost and Usage Report is authoritative, keyed on the `agent` session tag the gateway sets per call.\n\n**Every per-model panel is open-source-path only.** AgentCore Gateway is managed and exposes no in-cluster metrics endpoint; on that path these panels stay empty and CloudWatch is the equivalent.\n\n**The per-agent dimension is the route**, not an agent label — one HTTPRoute per agent, named `llm-<agent>`. Rename that template and every per-agent panel empties silently.\n\n**Refusals are on their own dashboard**, *Agents · policy decisions*: gateway, mesh, admission and network policy. **Not here at all:** tool-call outcomes and trajectories — those are spans, in Langfuse."
+          }
+        }
+      ]
+    }

@@ -1,0 +1,49 @@
+# The ADOT collector's pipeline.
+#
+# Everything naming an AWS resource comes from the file Terraform rendered, passed as a second
+# values file by the Argo CD Application: the Region, the log groups, the collector's service
+# account and role.
+
+region: "REGION_NOT_SET"
+cluster: "CLUSTER_NOT_SET"
+
+observability:
+  collectorNamespace: opentelemetry-operator-system
+  collectorServiceAccount: adot-collector
+  collectorRoleArn: ""
+  telemetryLogGroup: ""
+  # True when an evaluation reads the spans (enable_evaluations or enable_online_evaluation), which
+  # keeps prompt and completion content on them whatever collector.keepPromptContent says.
+  evaluationsReadSpans: false
+
+collector:
+  replicas: 2
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+  # Metric namespace EMF metrics are published into. Must be one of the namespaces the collector's
+  # IAM role permits, from metric_namespaces in terraform/modules/observability-aws; a namespace not
+  # on that list produces AccessDenied on every publish.
+  metricNamespace: EKSAgents/GenAI
+
+  # Keep the prompt and completion attributes on spans and log records.
+  #
+  # False is the default: the collector deletes gen_ai.prompt, gen_ai.completion,
+  # gen_ai.request.messages and gen_ai.response.messages before export, so agent content does not
+  # reach CloudWatch unless a team decides it should. The trajectory view keeps the shape of each
+  # step and loses what was said.
+  #
+  # Evaluations turn it on by themselves. With enable_evaluations or enable_online_evaluation,
+  # Terraform renders observability.evaluationsReadSpans true and the content stays, because both
+  # grade what the agent said from the spans. It then lands in CloudWatch Logs under that log
+  # group's retention and KMS key, which terraform/modules/observability-aws makes inputs rather
+  # than defaults for this reason.
+  #
+  # Set it true to keep content without evaluations.
+  keepPromptContent: false

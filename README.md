@@ -9,6 +9,7 @@ The samples are written to be read as well as run. Each one shows a working way 
 | Section | What it covers | User Guide section |
 | --- | --- | --- |
 | [AI/ML on EKS](ai-ml/) | GPU-ready clusters, model serving, shared storage and GPU health testing | [AI/ML on Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/ml-on-eks.html) |
+| [AI agents on EKS](agents/) | An agent platform on EKS Auto Mode, on an open source path or an AWS services path: Nitro Sandbox isolation, network policy, an egress gateway, a per-agent identity, and the layers each page turns on | [AI agents on Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/agents.html) |
 
 ## Repository layout
 
@@ -17,6 +18,10 @@ Each top-level directory is one section of the EKS User Guide and has its own RE
 ## AI/ML on EKS
 
 Samples for the [AI/ML on Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/ml-on-eks.html) section of the guide. They start with Terraform for a GPU-ready cluster, in an EKS Auto Mode variant and a self-managed Karpenter variant, and build on it with manifests for serving a model, mounting FSx for Lustre, and testing GPU fault detection and node repair. Start with the [AI/ML README](ai-ml/).
+
+## AI agents on EKS
+
+Terraform and GitOps templates for the [AI agents on Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/agents.html) section of the guide. The base is an EKS Auto Mode cluster that runs a sandboxed agent; each page of the guide then turns on one layer, such as the gateway, the mesh, ingress, memory, observability or evaluations, on either the open source path or the AWS services path. Start with the [agents README](agents/).
 
 ## Before you run a sample
 

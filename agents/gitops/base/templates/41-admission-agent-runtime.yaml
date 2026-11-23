@@ -1,0 +1,167 @@
+{{- if .Values.agentResource.enabled }}
+{{/*
+AN AGENT ON THE SANDBOX RUNTIME RUNS ONE POD, refused at admission rather than discovered later.
+
+`runtime: sandbox` -- the default -- composes one Agent Sandbox `Sandbox`, which has no replica
+count. An Agent asking for `replicas: 2` on it would be accepted, compose a single pod, and serve a
+fraction of the capacity its author declared, with nothing reporting the difference. A horizontally
+scaled agent is what `runtime: deployment` is for.
+
+WHY A POLICY AND NOT THE AGENT'S OWN SCHEMA. The rule relates two fields, and kro's schema has no
+cross-field validation: its SimpleSchema markers are per field, and a `validation` block on the
+ResourceGraphDefinition is not part of its API -- it is dropped on apply without an error. On EKS's
+kro capability an Agent with replicas: 2 and the default runtime is admitted and runs one pod
+without this policy. The CRD's own defaults are applied before admission, so an Agent that names
+neither field reads here as sandbox with replicas 1.
+*/}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: eks-agents-agent-runtime
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["agents.eks.amazonaws.com"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["agents"]
+  # ONLY A CHANGE TO THE SPEC IS JUDGED. An update that leaves the spec alone -- kro removing its
+  # finalizer, a label, a status write -- always passes, and so does any write to an Agent already
+  # being deleted. Without this an Agent that predates the policy with replicas above 1 could never
+  # be deleted: kro's finalizer removal is an UPDATE, the policy would refuse it, and the Agent would
+  # sit in deletion with `failed removing finalizer ... denied`.
+  variables:
+    - name: judged
+      expression: >-
+        !has(object.metadata.deletionTimestamp) &&
+        (request.operation == 'CREATE' || oldObject.spec != object.spec)
+  validations:
+    - expression: >-
+        !variables.judged ||
+        (has(object.spec.runtime) && object.spec.runtime == 'deployment') ||
+        !has(object.spec.replicas) || object.spec.replicas <= 1
+      reason: Invalid
+      messageExpression: >-
+        'Agent ' + object.metadata.name + ' asks for ' + string(object.spec.replicas) +
+        ' replicas on the sandbox runtime, which runs exactly one pod. Set replicas: 1, or ' +
+        'runtime: deployment for an agent that keeps its state outside the pod and scales out.'
+    # A persistent workspace is a Sandbox's: a Deployment's replicas would contend for one
+    # ReadWriteOncePod volume, and the Deployment composes none.
+    - expression: >-
+        !variables.judged || !has(object.spec.workspaceSize) || object.spec.workspaceSize == '' ||
+        !has(object.spec.runtime) || object.spec.runtime == 'sandbox'
+      reason: Invalid
+      messageExpression: >-
+        'Agent ' + object.metadata.name + ' sets workspaceSize with runtime: deployment. A persistent ' +
+        'workspace is one volume for one pod: it is a Sandbox feature. Use runtime: sandbox, or drop ' +
+        'workspaceSize and keep the state outside the pod.'
+    # FIXED AT CREATION. Changing either swaps the Sandbox resource kro composes for another one of
+    # the same name, which kro applies as an update to the existing Sandbox (for the probed/unprobed
+    # swap: same uid, no delete). The Sandbox CRD refuses any change to
+    # volumeClaimTemplates, adding or removing included, so the Agent would be accepted here and then
+    # never reconcile. Refused at the Agent instead, where the message can say what to do.
+    - expression: >-
+        !variables.judged || request.operation == 'CREATE' ||
+        (oldObject.spec.?workspaceSize.orValue('') == object.spec.?workspaceSize.orValue('') &&
+         oldObject.spec.?workspaceStorageClass.orValue('') == object.spec.?workspaceStorageClass.orValue(''))
+      reason: Forbidden
+      messageExpression: >-
+        'Agent ' + object.metadata.name + ' changes workspaceSize or workspaceStorageClass after ' +
+        'creation. A Sandbox cannot change its volume claim templates, so the Agent would never ' +
+        'reconcile. To resize, create a new Agent and move the data; to drop the workspace, delete ' +
+        'and recreate the Agent.'
+    # EVERY MODEL ARN IS A BEDROCK ARN, and nothing else. kro joins this list into the JSON of the
+    # agent's IAM policy (40-agent-rgd.yaml, InvokeGrantedModels), and CEL's join() does not escape.
+    # An entry carrying a quote could close the Resource array and append a statement of its own --
+    # with actions the permissions boundary allows on any resource, such as s3:GetObject on another
+    # agent's checkpoints. A bare "*" would grant every model. The character class below has no
+    # quote, backslash, comma or whitespace, so an entry can only ever be one ARN.
+    - expression: >-
+        !variables.judged ||
+        object.spec.modelArns.all(a, a.matches(
+          '^arn:aws(-[a-z]+)*:bedrock:[a-z0-9*-]*:([0-9]{12}|[*])?:(foundation-model|inference-profile|application-inference-profile|provisioned-model|custom-model|imported-model|default-prompt-router|prompt-router)/[A-Za-z0-9._:*/-]+$'))
+      reason: Invalid
+      messageExpression: >-
+        'Agent ' + object.metadata.name + ' lists a modelArns entry that is not a Bedrock model, ' +
+        'inference-profile or prompt-router ARN. Each entry becomes one IAM Resource; name the ' +
+        'foundation-model ARN in every Region a cross-Region profile routes to, and the profile ARN.'
+    # AN AGENT LIVES IN AN AGENT NAMESPACE. The sandbox runtime rule (20-admission-sandbox.yaml) and
+    # the ACK capability's IAM namespace condition both key on that, so an Agent elsewhere would
+    # compose a pod no sandbox rule judges, or an IAM role ACK is refused -- and its role and route
+    # are named from the bare Agent name, so it could also claim a name an agent namespace uses.
+    - expression: >-
+        !variables.judged ||
+        namespaceObject.metadata.?labels[?'eks-agents/admission'].orValue('') == 'enforce'
+      reason: Forbidden
+      messageExpression: >-
+        'Agent ' + object.metadata.name + ' is in namespace ' + object.metadata.namespace +
+        ', which is not an agent namespace. Create it in a namespace labelled ' +
+        'eks-agents/admission: enforce (namespaces.reasoning by default).'
+    # PERMISSION SETS ARE THE PLATFORM TEAM'S. An Agent names sets; Terraform defines them
+    # (agent_permission_sets) and says which namespaces may use each. A name that is not defined
+    # would make ACK attach a policy that does not exist and the role would never sync; a set not
+    # offered to this namespace is refused outright.
+    {{- $sets := .Values.agentResource.permissionSets | default dict }}
+    - expression: >-
+        !variables.judged ||
+        object.spec.?permissionSets.orValue([]).all(p,
+          p in {{ toJson $sets }} &&
+          (size({{ toJson $sets }}[p]) == 0 || object.metadata.namespace in {{ toJson $sets }}[p]))
+      reason: Forbidden
+      messageExpression: >-
+        'Agent ' + object.metadata.name + ' names a permission set that is not defined for namespace ' +
+        object.metadata.namespace + '. Defined: {{ keys $sets | sortAlpha | join ", " | default "none" }}. ' +
+        'The platform team adds one with agent_permission_sets in Terraform.'
+    # RUNTIME TASKS NEEDS THE PLATFORM'S QUEUES, and serves nothing. The queues are created per agent
+    # by Terraform (enable_agent_tasks, task_agents), so an Agent not listed there has no queue to
+    # read; and a task pod answers through its result queue, never through a Service or a route.
+    {{- $tasks := .Values.tasks | default dict }}
+    - expression: >-
+        !variables.judged || object.spec.?runtime.orValue('sandbox') != 'tasks' ||
+        ({{ ternary "true" "false" ($tasks.enabled | default false) }} &&
+         object.metadata.namespace == {{ .Values.namespaces.reasoning | quote }} &&
+         object.metadata.name in {{ toJson ($tasks.agents | default list) }} &&
+         object.spec.?expose.orValue('none') == 'none')
+      reason: Invalid
+      messageExpression: >-
+        'Agent ' + object.metadata.name + ' asks for runtime: tasks. That needs enable_agent_tasks with ' +
+        'this agent in task_agents (which creates its queues), the namespace {{ .Values.namespaces.reasoning }}, ' +
+        'and expose: none. Task queues on this cluster: {{ ($tasks.agents | default list) | join ", " | default "none" }}.'
+    {{- if and .Values.chatUi.enabled .Values.ingress.domainName }}
+    # THE CHAT UI'S HOSTNAME IS NOT AN AGENT'S. An Agent's route claims <name>.<domain> by default,
+    # so an Agent named after the UI's prefix -- or one setting routeHostname to it -- would share
+    # the UI's listener host, and which backend a person reaches would depend on rule order.
+    - expression: >-
+        !variables.judged || object.spec.?expose.orValue('none') != 'route' ||
+        (object.spec.?routeHostname.orValue('') != '' ? object.spec.routeHostname :
+         object.metadata.name + '.{{ .Values.ingress.domainName }}').lowerAscii() !=
+        '{{ printf "%s.%s" .Values.chatUi.hostnamePrefix .Values.ingress.domainName | lower }}'
+      reason: Forbidden
+      messageExpression: >-
+        'Agent ' + object.metadata.name + ' would route at the chat UI hostname ' +
+        '{{ printf "%s.%s" .Values.chatUi.hostnamePrefix .Values.ingress.domainName | lower }}. ' +
+        'Rename the Agent or set routeHostname to another name the listener certificate covers.'
+    {{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: eks-agents-agent-runtime
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  policyName: eks-agents-agent-runtime
+  # Deny, regardless of admission.validationAction: this policy guards the shape of a resource this
+  # chart defines, not a workload a tenant brings, so there is no adoption period to audit through.
+  validationActions: [Deny]
+  matchResources: {}
+{{- end }}

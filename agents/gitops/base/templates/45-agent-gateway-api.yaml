@@ -1,0 +1,231 @@
+{{- if .Values.ingress.enabled }}
+
+{{/*
+The gateway.k8s.aws CRDs these objects need are in this chart (44-aws-gateway-api-crds.yaml, wave
+-2), so there is no render-time check for them: the render cannot depend on cluster state the same
+sync creates. A `fail` on `.Capabilities.APIVersions` would stall the Application until Argo CD next
+hard-refreshed it whenever the CRDs arrived after the render.
+*/}}
+
+{{/*
+The agents' ingress, as Gateway API rather than Ingress.
+
+Gateway API is the successor to Ingress, and on EKS Auto Mode the gateway controllers
+are managed the same way the Ingress path is -- there is no controller to install. It is also a
+better fit for this stack than Ingress for a reason that is structural rather than stylistic: the
+Gateway API splits ingress across three roles, and those roles are exactly the split this
+repository already draws.
+
+  GatewayClass   platform team      which controller, and what kind of load balancer
+  Gateway        cluster operator   the load balancer itself, its listeners and its TLS
+  HTTPRoute      application        which path reaches which Service
+
+So the first two live here, in the chart the platform team owns, and the route lives on the Agent
+resource a developer fills in. With Ingress all three are one object, which meant an agent author
+editing the annotation that decides whether ingress is internet-facing. They cannot now:
+there is one Gateway, the platform team owns it, and an agent attaches a route to it.
+
+ONE LOAD BALANCER, NOT ONE PER AGENT. A Gateway is a load balancer, so a Gateway per agent is an ALB
+per agent. The agents share this one and attach HTTPRoutes with their own hostnames, which is both
+cheaper and the shape that lets the platform team put the OIDC flow and the access logs in one place.
+
+ENABLEMENT IS A CLUSTER SETTING, AND IT IS NOT SET BY THESE TEMPLATES. Gateway API on Auto Mode is
+turned on in the cluster's kubernetesNetworkConfig.elasticLoadBalancing.gatewayApi block, which
+terraform/modules/agent-cluster leaves at crds.managed false by default: this repository installs the standard
+Gateway API CRDs itself (10-gateway-api-crds.yaml) and the gateway.k8s.aws CRDs from
+44-aws-gateway-api-crds.yaml. Without that setting the objects below are accepted and the
+GatewayClass sits with Accepted=Unknown, reason Pending, because no controller claims it, even with
+load balancing enabled and Gateway API CRDs at v1.
+
+Check it rather than assuming:
+
+  kubectl get gatewayclass {{ .Values.ingress.gatewayClassName }} \
+    -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}'
+*/}}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Values.ingress.gatewayClassName }}
+  annotations:
+    # ONE WAVE BEFORE THE GATEWAY, for the order things are DELETED in. Argo CD prunes in reverse
+    # wave order and waits for each wave to be gone before the next (on the managed capability too),
+    # so turning ingress off deletes the Gateway -- and the controller
+    # deletes its load balancer -- while this class and its LoadBalancerConfiguration still exist.
+    # Pruned together, the configuration's deletion leaves the class "hasn't processed latest
+    # loadbalancer config", the controller stops processing the Gateway, and the load balancer,
+    # the Gateway and the class wait on each other indefinitely. This is why the
+    # base Application does not set PruneLast: with it, every prune runs at once.
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  # The EKS Auto Mode ALB controller. L7, because an agent's ingress terminates HTTP and runs an
+  # OIDC flow; the NLB controller is eks.amazonaws.com/gateway-nlb and would move the caller's
+  # authentication inside the cluster, because an NLB runs no OIDC flow.
+  #
+  # These controller names are Auto Mode's own, so they coexist with Istio's and AgentGateway's
+  # GatewayClasses on the same cluster -- which matters here, because this stack runs all three.
+  controllerName: eks.amazonaws.com/gateway-alb
+
+  {{- if .Values.ingress.loadBalancerConfiguration }}
+  parametersRef:
+    group: gateway.k8s.aws
+    kind: LoadBalancerConfiguration
+    name: agent-ingress
+    namespace: {{ .Values.ingress.namespace }}
+  {{- end }}
+---
+{{- if .Values.ingress.loadBalancerConfiguration }}
+{{/*
+The AWS-specific load balancer properties, as a reviewable object rather than a wall of annotations.
+
+This is where the Ingress annotations went. Scheme, subnets, security groups and access logs are
+fields on a typed resource now, which means a platform team reviews them in a pull request and a
+mistake is a schema error rather than a misspelled annotation key that is silently ignored.
+*/}}
+apiVersion: gateway.k8s.aws/v1
+kind: LoadBalancerConfiguration
+metadata:
+  name: agent-ingress
+  namespace: {{ .Values.ingress.namespace }}
+  annotations:
+    # With the GatewayClass, one wave before the Gateway; see the class above.
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  # Internal, and this is the single most important line in the file.
+  #
+  # An agent reachable from the internet is the same exposure as a managed endpoint left public, and
+  # nothing else in this stack prevents it -- the egress controls govern what leaves an agent and say
+  # nothing about what reaches it. Because this sits on the GatewayClass the platform team owns, an
+  # agent author cannot change it, which is the property the Ingress shape did not have.
+  scheme: {{ .Values.ingress.scheme }}
+  ipAddressType: ipv4
+
+  # The ACM certificate for the HTTPS listener, which has to cover every hostname an agent's route
+  # claims. This is the only place the controller reads it from -- see the note on the listener's
+  # `tls` block below, and keep the protocolPort in step with the listener.
+  listenerConfigurations:
+    - protocolPort: HTTPS:443
+      defaultCertificate: {{ .Values.ingress.certificateArn | quote }}
+
+  {{- with .Values.ingress.wafWebAclArn }}
+  # The AWS WAF web ACL, with enable_ingress_waf. The controller associates it when it creates the
+  # load balancer, so every request is inspected before the listener rule's sign-in runs.
+  wafV2:
+    webACL: {{ . | quote }}
+  {{- end }}
+
+  {{- with .Values.ingress.subnetIds }}
+  loadBalancerSubnets:
+    {{- range . }}
+    - identifier: {{ . | quote }}
+    {{- end }}
+  {{- end }}
+
+  {{- with .Values.ingress.securityGroupIds }}
+  securityGroups:
+    {{- range . }}
+    - {{ . | quote }}
+    {{- end }}
+  # A named group replaces the one the controller would make, and the controller then leaves the
+  # targets' side alone unless told otherwise -- every target would time out its health check.
+  manageBackendSecurityGroupRules: true
+  {{- end }}
+
+  loadBalancerAttributes:
+    # The idle timeout raised past a plausible agent turn. The default is 60 seconds, shorter than
+    # many turns, and protocol keepalives do not substitute because the load balancer ignores
+    # HTTP/2 PING frames for this purpose. This raises a limit rather than removing one: a streaming
+    # transport and session state outside the pod are the durable answer.
+    - key: idle_timeout.timeout_seconds
+      value: {{ .Values.ingress.idleTimeoutSeconds | quote }}
+    - key: routing.http.drop_invalid_header_fields.enabled
+      value: "true"
+    {{- if .Values.ingress.accessLogBucket }}
+    # Who called the agent. The gateway's own audit log does not carry this: it sees the agent
+    # calling out, not the person calling in.
+    - key: access_logs.s3.enabled
+      value: "true"
+    - key: access_logs.s3.bucket
+      value: {{ .Values.ingress.accessLogBucket | quote }}
+    - key: access_logs.s3.prefix
+      value: alb/agents
+    {{- end }}
+---
+{{- end }}
+{{/*
+The Gateway: one load balancer, shared by every agent that attaches a route.
+
+HTTPS only. There is no HTTP listener, so there is no plaintext path to misconfigure and no redirect
+to get wrong.
+*/}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ .Values.ingress.gatewayName }}
+  namespace: {{ .Values.ingress.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  gatewayClassName: {{ .Values.ingress.gatewayClassName }}
+
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+
+      {{- if not .Values.ingress.certificateArn }}
+      {{ fail "ingress.certificateArn is required when ingress.enabled is true. The listener is HTTPS only, so without a certificate the Gateway is accepted and programs no listener -- which looks like a routing problem rather than a missing certificate." }}
+      {{- end }}
+      {{- if not .Values.ingress.loadBalancerConfiguration }}
+      {{ fail "ingress.enabled needs ingress.loadBalancerConfiguration: true. The LoadBalancerConfiguration is the only object this controller reads the HTTPS listener's certificate from, so without it the certificate has nowhere to go and the listener comes up with none -- and the scheme becomes a controller default rather than a declared field." }}
+      {{- end }}
+      tls:
+        mode: Terminate
+
+        # THE CERTIFICATE HAS TO BE IN TWO PLACES, and only one of them is read. Both halves:
+        #
+        # 1. Leave this block out and the API server REFUSES the Gateway -- the standard Gateway API
+        #    CRD carries its own CEL rule:
+        #
+        #      spec.listeners[0].tls: Invalid value: "object": no such key: certificateRefs
+        #      evaluating rule: certificateRefs or options must be specified when mode is Terminate
+        #
+        # 2. The AWS Load Balancer Controller does not read it. Its Gateway API feature comparison
+        #    marks `ListenerTLSConfig - CertificateRefs` and `- Options` both "❌ -- Use LB Config"
+        #    (v3.5), and the certificate the listener actually serves is `defaultCertificate` on the
+        #    LoadBalancerConfiguration below.
+        #
+        # So this satisfies the schema and the LoadBalancerConfiguration does the work. Keep the two
+        # in step anyway: a reader who changes one and not the other has no way to tell which is
+        # live, and there is no status condition that reports the difference.
+        options:
+          gateway.k8s.aws/certificate-arn: {{ .Values.ingress.certificateArn | quote }}
+
+      allowedRoutes:
+        # Routes from the agent namespaces, so an agent attaches its own route without the platform
+        # team editing this object per agent -- and nothing outside those namespaces can attach one.
+        namespaces:
+          from: Selector
+          selector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  # The reasoning namespace for workload-gated routes (jwt-validation, which needs no
+                  # credential) and the ingress namespace for every browser-gated route. See
+                  # 00-namespaces.yaml for why browser routes live apart from the agents.
+                  - {{ .Values.namespaces.reasoning }}
+                  - {{ .Values.namespaces.ingress }}
+        kinds:
+          # HTTPRoute only. A TCPRoute on this listener would bypass the HTTP-level controls --
+          # the OIDC flow, the path matching and the header handling -- that are the reason the
+          # ingress is L7.
+          - kind: HTTPRoute
+{{- end }}

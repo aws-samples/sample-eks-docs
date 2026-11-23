@@ -1,0 +1,66 @@
+{{- if not (has "29-agentgateway-crds.yaml" .Values.excluded) }}
+# AgentGateway's CRDs, which the main chart does not carry.
+#
+# A separate Application because they are a separate chart. The agentgateway chart contains no
+# `crds/` directory and renders only RBAC, a Deployment, a Service and a ServiceAccount — so
+# `skipCrds: false` on the install does nothing, and without this the controller crashloops:
+#
+#   watch error in cluster: failed to list *agentgateway.AgentgatewayPolicy:
+#   the server could not find the requested resource (get agentgatewaypolicies.agentgateway.dev)
+#   waiting for sync... informer/AgentgatewayBackends attempt 1050
+#
+# Note that this chart carries two kinds this stack does not configure, AgentgatewayModel and
+# AgentgatewayParameters, and the controller watches for all of them. So installing a subset by hand
+# would leave it waiting on the ones you skipped.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agentgateway-crds
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    # Before the chart that needs them, and before the configuration written against them.
+    argocd.argoproj.io/sync-wave: "-1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: cr.agentgateway.dev/charts
+    chart: agentgateway-crds
+    # Pinned to the same version as the gateway chart. See VERSIONS.md.
+    targetRevision: v1.7.0
+
+  destination:
+    name: eks-agents
+    namespace: agentgateway-system
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      # prune: false. Pruning a CRD deletes every object of that kind on the cluster, so a sync that
+      # briefly lost sight of this Application would take the gateway's entire configuration —
+      # backends, routes and policies — with it. Removing a CRD is a manual operation.
+      prune: false
+      selfHeal: true
+
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # CRDs exceed the annotation size limit client-side apply uses for last-applied config.
+      - Replace=true
+{{- end }}

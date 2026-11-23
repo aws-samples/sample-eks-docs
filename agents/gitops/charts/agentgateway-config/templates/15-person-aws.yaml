@@ -1,0 +1,138 @@
+{{- $pa := .Values.personAccess | default dict }}
+{{- $vg := $pa.viaGateway | default dict }}
+{{- if and $pa.enabled $vg.enabled }}
+{{- if not (and $pa.issuer $vg.audience $pa.roleArnPrefix $pa.bucket) }}
+{{ fail "personAccess.viaGateway.enabled needs personAccess.issuer, roleArnPrefix, bucket and viaGateway.audience; Terraform writes them with person_access_via_gateway." }}
+{{- end }}
+{{- $services := dict "s3" (printf "s3.%s.amazonaws.com" $vg.region) }}
+{{- range $svc, $host := ($vg.services | default dict) }}
+{{- $_ := set $services $svc $host }}
+{{- end }}
+{{- range $agent := $pa.agents }}
+{{- range $svc, $host := $services }}
+---
+{{/*
+{{ $svc }} WITH A PERSON'S AUTHORITY, FOR {{ $agent }}, SIGNED BY THE GATEWAY (person_access_via_gateway).
+S3 is built in (the person-data bucket); every other service is person_access_gateway_services, whose
+IAM statements key the access on the person tag.
+
+  agent -- Authorization: its own token, x-person-token: the person's ID token -->
+  gateway: PreRouting verifies the agent and that /aws/{{ $agent }}/ is its own path
+           (00-gateway.yaml); this route's policy below verifies the person's token
+  gateway -- STS AssumeRole as its own role, tags person=<sub> agent={{ $agent }} -->
+           {{ $pa.roleArnPrefix }}{{ $agent }}-person-data
+  gateway -- SigV4 with those credentials --> {{ $host }}, scoped by IAM to the person tag
+
+AgentGateway's AWS auth cannot pass the request's token to STS (no AssumeRoleWithWebIdentity), so
+STS sees the gateway's assertion of the person, not the person's token. The role trusts this
+gateway alone, and only with both tags (terraform/modules/person-access). Credentials are cached
+per distinct session name and tags -- that is, per person -- and every request still needs a valid
+person token at this route, so an expired token is refused even while a cached credential lives.
+
+THE CALLER SENDS x-amz-content-sha256 (the body's SHA-256). S3 requires it, and AgentGateway's signer
+hashes the body without adding the header; apps/common/person_access.py sets it.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: person-{{ $svc }}-{{ $agent }}
+  namespace: {{ $.Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  static:
+    host: {{ $host | quote }}
+    port: 443
+  policies:
+    tls:
+      sni: {{ $host | quote }}
+    auth:
+      aws:
+        serviceName: {{ $svc | quote }}
+        region: {{ $vg.region | quote }}
+        assumeRole:
+          roleArn: {{ printf "%s%s-person-data" $pa.roleArnPrefix $agent | quote }}
+          # The trust requires a session named for the agent; the sub makes CloudTrail name the person.
+          sessionNameExpression: {{ printf "\"%s-\" + jwt.sub" $agent | quote }}
+          tags:
+            - key: person
+              expression: jwt.sub
+            - key: agent
+              value: {{ $agent | quote }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: person-{{ $svc }}-{{ $agent }}
+  namespace: {{ $.Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $.Values.gateway.name }}
+      sectionName: egress
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /aws/{{ $agent }}/{{ $svc }}
+      filters:
+        # The agent addresses /aws/<agent>/<service>/...; the service sees /... (S3: path style).
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /
+      backendRefs:
+        - group: agentgateway.dev
+          kind: AgentgatewayBackend
+          name: person-{{ $svc }}-{{ $agent }}
+          weight: 1
+---
+# The person's token, verified at this route: signed by the pool, unexpired, and an ID TOKEN FOR THE
+# API CLIENT. Strict, so a request without one is refused before any AssumeRole. The token is
+# removed after verification, so it never reaches S3.
+#
+# `audiences` refuses a Cognito access token, which carries client_id and no aud (401). The rule
+# below states the same requirement explicitly -- an ID token,
+# for the api client -- so it still holds if the provider list is ever given a second audience.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: person-{{ $svc }}-{{ $agent }}
+  namespace: {{ $.Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: person-{{ $svc }}-{{ $agent }}
+  traffic:
+    jwtAuthentication:
+      mode: Strict
+      location:
+        header:
+          name: x-person-token
+      providers:
+        - issuer: {{ $pa.issuer | quote }}
+          audiences:
+            - {{ $vg.audience | quote }}
+          jwks:
+            remote:
+              url: {{ printf "%s/.well-known/jwks.json" $pa.issuer | quote }}
+              cacheDuration: 10m
+    authorization:
+      action: Require
+      policy:
+        matchExpressions:
+          - 'jwt.token_use == "id"'
+          - {{ printf "jwt.aud == %q" $vg.audience | quote }}
+{{- end }}
+{{- end }}
+{{- end }}

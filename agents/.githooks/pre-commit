@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# Refuse a commit carrying one deployment's own account, cluster or endpoints.
+#
+# WHY A HOOK AND NOT JUST A CHECK. `scripts/validate.sh` runs the same check, but reading its
+# output is a step a person can skip -- and the file it guards,
+# gitops/platform/<path>/terraform-values.yaml, is REWRITTEN BY EVERY `terraform apply`. So the
+# window between "apply" and "commit" is exactly when the tree contains your account id, and that is
+# the moment a commit is most likely. A check you have to remember to run does not help there.
+#
+# Enable it once per clone:
+#
+#   git config core.hooksPath .githooks
+#
+# It runs one python script over the STAGED tree and takes well under a second. Nothing here reaches
+# the network or needs credentials.
+set -uo pipefail
+
+root="$(cd "$(dirname "$0")/.." && pwd)"   # this directory, which need not be the repository's root
+cd "$root" || exit 0
+
+[[ -f scripts/lib/check_no_account_values.py ]] || exit 0
+
+if ! python3 scripts/lib/check_no_account_values.py --staged; then
+  echo
+  # SINGLE QUOTES, and the reason is not style. In double quotes, backticks are a COMMAND
+  # SUBSTITUTION, and the hook would run `terraform apply` from whatever directory the commit is
+  # made in.
+  echo 'pre-commit: refused. The usual cause is terraform-values.yaml, which terraform apply' >&2
+  echo "rewrote with your account's values. Restore the committed placeholder:" >&2
+  echo "    git checkout gitops/platform/<path>/terraform-values.yaml" >&2
+  echo
+  echo "Commit the rendered file to your own fork only -- see AGENTS.md, \"Nothing from your" >&2
+  echo "account goes back\". To commit anyway, with a reason: git commit --no-verify" >&2
+  exit 1
+fi

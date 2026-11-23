@@ -1,0 +1,205 @@
+# The out-of-box agent dashboard, and the two scrapes it needs to have data.
+#
+# TWO SOURCES, AND THEY ANSWER DIFFERENT QUESTIONS. Neither alone is enough, which is why this
+# chart renders both a ServiceMonitor and a PodMonitor:
+#
+#   the gateway   per-model and per-agent token usage, and RESOLVED USD COST. The gateway prices
+#                 each call from its own model cost catalogue, so there is no price table in this
+#                 chart to maintain or get wrong. Open source path only -- AgentCore Gateway is
+#                 managed and exposes no in-cluster metrics endpoint.
+#   the agent     the agent's own event loop: cycle duration, turn latency, time to first token.
+#                 The gateway sees requests; only the agent sees its own loop.
+#
+# NO PRICE TABLE, AND PER-MODEL PANELS INSTEAD. The gateway emits the full GenAI conventions,
+# including cost in dollars with a model dimension, so a hand-maintained price table is both
+# unnecessary and less accurate.
+
+namespaces:
+  reasoning: agents
+
+# Where the OpenTelemetry collector runs, and the port its `prometheus` exporter listens on. The
+# ServiceMonitor this chart renders is what gets the AGENT's metrics into Prometheus -- without it
+# the collector exports them to an endpoint nothing scrapes, and those panels are empty while every
+# component reports healthy.
+collector:
+  # The collector Application installs into monitoring, alongside Prometheus and Grafana.
+  namespace: monitoring
+  # Matches the upstream chart's Service labels. Check with:
+  #   kubectl -n <namespace> get svc --show-labels | grep collector
+  serviceSelector:
+    app.kubernetes.io/name: opentelemetry-collector
+  # The port name on that Service, which is `metrics` in the `ports` block on the collector's
+  # Application in gitops/platform/open-source/templates/50-observability.yaml. Named there, not numbered
+  # here: a ServiceMonitor that names a port the Service does not have silently scrapes nothing.
+  portName: metrics
+  interval: 30s
+
+# The gateway's own metrics, which is where every per-model and every dollar figure comes from.
+#
+# A PodMonitor, NOT a ServiceMonitor, and that is the trap this block exists to document. The
+# gateway's data plane serves these on port 15020, and the Service its controller creates publishes
+# only the listener port:
+#
+#   kubectl -n agentgateway-system get svc egress \
+#     -o jsonpath='{range .spec.ports[*]}{.name}={.port} {end}'
+#   -> listener-8080=8080
+#
+# So a ServiceMonitor has no port to name and scrapes nothing. Nothing scrapes 15020 by default.
+# Read it by hand with:
+#
+#   DP=$(kubectl -n agentgateway-system get pod -l app.kubernetes.io/name=egress \
+#     -o jsonpath='{.items[0].metadata.name}')
+#   kubectl -n agentgateway-system port-forward pod/$DP 19092:15020
+#   curl -s localhost:19092/metrics | grep agentgateway_gen_ai
+gateway:
+  enabled: true
+  namespace: agentgateway-system
+  # The port the data plane serves metrics on. Unpublished by the SERVICE, but declared by the
+  # CONTAINER, which is what lets a PodMonitor name it:
+  #
+  #   kubectl -n agentgateway-system get pod \
+  #     -l gateway.networking.k8s.io/gateway-name=egress \
+  #     -o jsonpath='{range .items[0].spec.containers[*]}{range .ports[*]}{.name}={.containerPort} {end}{end}'
+  #   -> metrics=15020
+  #
+  # Name, not number: `targetPort: 15020` renders, and the operator then logs that targetPort is
+  # deprecated and produces no active target. The number is kept only for the documentation above.
+  metricsPort: 15020
+  metricsPortName: metrics
+  interval: 30s
+  # Selects the data plane pods of one Gateway. `gateway-name` rather than `app.kubernetes.io/name`
+  # because it is the Gateway object's own name and so survives a chart rename, and it does not
+  # also match the controller, which serves different ports.
+  podSelector:
+    gateway.networking.k8s.io/gateway-name: egress
+
+  metrics:
+    # Token usage, per model AND per agent. A histogram, so _sum is the token count.
+    tokens: agentgateway_gen_ai_client_token_usage
+    # Resolved cost in US dollars, cumulative. A counter, so take rate() or increase().
+    cost: agentgateway_gen_ai_client_cost_usd_total
+    # Whether the gateway found a price for the model. status="Exact" means the dollar figures above
+    # are the catalogue's real prices; anything else means they are not, which is the one thing that
+    # can make the spend panels quietly wrong.
+    catalogLookups: agentgateway_cost_catalog_lookups_total
+    # Server-side latency, all histograms.
+    requestDuration: agentgateway_gen_ai_server_request_duration
+    timeToFirstToken: agentgateway_gen_ai_server_time_to_first_token
+    timePerOutputToken: agentgateway_gen_ai_server_time_per_output_token
+    interChunkLatency: agentgateway_gen_ai_server_inter_chunk_latency
+
+  labels:
+    # The model the agent asked for. `gen_ai_response_model` also exists and is frequently
+    # "unknown", so group on the request model: grouping on the response model splits one model's
+    # series in two and halves every per-model figure.
+    requestModel: gen_ai_request_model
+    tokenType: gen_ai_token_type
+    operation: gen_ai_operation_name
+    system: gen_ai_system
+    # THERE IS NO AGENT LABEL. The per-agent dimension is the ROUTE, which on the open source path
+    # is one HTTPRoute per agent named llm-<agent> -- so the label value is
+    # "<namespace>/llm-<agent>" and the recording rules extract the agent name from it with
+    # label_replace. If you rename the route template in
+    # gitops/charts/agentgateway-config/templates/20-routes.yaml, change routePattern to match or
+    # every per-agent panel silently empties.
+    route: route
+  routePattern: ".*/llm-(.*)"
+
+# The agent's own metrics, from the Strands SDK by way of the collector.
+#
+# These carry NO model label and no token-type label, so nothing keyed on a model can come from
+# here -- that is the gateway's job. What they do carry is the agent's own loop, which the gateway
+# cannot see.
+agentMetrics:
+  latency: strands_event_loop_latency_milliseconds
+  timeToFirstToken: strands_model_time_to_first_token_milliseconds
+  cycleDuration: strands_event_loop_cycle_duration_seconds
+  inputTokens: strands_event_loop_input_tokens_token
+  outputTokens: strands_event_loop_output_tokens_token
+  labels:
+    # `resource_to_telemetry_conversion` in the collector turns the agent's resource attributes
+    # into labels, which is where eks_agent comes from.
+    agent: eks_agent
+    errorType: error_type
+
+# Spend.
+#
+# NO PRICE TABLE. The gateway resolves each call against its own model cost catalogue and emits
+# dollars, so there is nothing here to keep in step with a pricing page. Watch the catalogue-status
+# panel instead: a non-Exact lookup is the condition under which these figures stop being real.
+#
+# Authoritative per-agent cost is still the Cost and Usage Report, keyed on the `agent` session tag
+# the gateway sets when it assumes each agent's role. These panels are the near-real-time view, not
+# the invoice.
+cost:
+  enabled: true
+
+# Labels the PrometheusRule has to carry for Prometheus to load it at all.
+#
+# NOT COSMETIC, and the default here is not a guess. The Prometheus object kube-prometheus-stack
+# creates selects rules by label, and on a default install that selector is:
+#
+#   kubectl -n monitoring get prometheus \
+#     -o jsonpath='{.items[0].spec.ruleSelector}'
+#   -> {"matchLabels":{"release":"kube-prometheus-stack"}}
+#
+# A PrometheusRule without it is created, reports nothing wrong, and is **ignored** -- so every
+# panel built on a recording rule is permanently empty while `kubectl get prometheusrule` shows the
+# object present: the rules can exist for hours without Prometheus ever loading them.
+#
+# The value is the stack's own Helm release name. Change it if yours differs, and check it with the
+# command above rather than assuming.
+ruleSelectorLabels:
+  release: kube-prometheus-stack
+
+budgets:
+  enabled: true
+  defaultTokensPerHour: 1000000
+  perAgent: {}
+
+dashboard:
+  # The sidecar in kube-prometheus-stack watches every namespace for this label, so the ConfigMap
+  # can live anywhere. It goes in the monitoring namespace to keep Grafana's inputs together.
+  namespace: monitoring
+  sidecarLabel: grafana_dashboard
+  folder: Agents
+  # UID is stable so a team can link to the dashboard and so an update replaces it rather than
+  # creating a second copy.
+  uid: eks-agents-overview
+  refresh: 30s
+  datasource: Prometheus
+
+# The policy decisions dashboard: what each layer refused, in one view. The open source counterpart
+# of the AWS services path's CloudWatch dashboard (the agents-observability page of the EKS User
+# Guide). Every source is a
+# Prometheus counter; there is no log store on this path, so these are counts, not records.
+#
+#   gateway      agentgateway_requests_total, by the agent label the gateway's request-metrics
+#                policy adds (jwt.sub; "unauthenticated" when no valid token came), route and
+#                status. 401 is no valid agent token; 403 an agent on another agent's route.
+#   mesh         ztunnel's istio_tcp_connections_closed_total with response_flags="DENY": an
+#                AuthorizationPolicy refused the connection. Names the caller's workload and
+#                principal and the destination.
+#   admission    the API server's apiserver_validating_admission_policy_check_total, by policy, with
+#                enforcement_action="deny". Scraped by kube-prometheus-stack's apiserver monitor; no
+#                audit log needed.
+#   network      netpol_flow_verdicts_total and netpol_flow_denials_total, from the netpol-verdicts
+#                collector on the agents' nodes (gitops/platform/open-source/templates/50-observability.yaml).
+policyDecisions:
+  enabled: true
+  uid: eks-agents-policy-decisions
+  # The ztunnel DaemonSet's metrics. Port 15020, named on the container.
+  ztunnel:
+    namespace: istio-system
+    podSelector:
+      app: ztunnel
+    portName: ztunnel-stats
+    path: /metrics
+    interval: 30s
+  # The netpol-verdicts collector's metrics.
+  netpolVerdicts:
+    namespace: monitoring
+    podSelector:
+      app.kubernetes.io/instance: netpol-verdicts
+    portName: verdicts
+    interval: 30s

@@ -1,0 +1,950 @@
+# Defaults for the shared cluster objects.
+#
+# Every value here that names an AWS resource is overridden by the file Terraform renders:
+# ../platform/open-source/terraform-values.yaml or ../platform/aws-services/terraform-values.yaml.
+# The Argo CD Application for your path passes that file as a second values file, so what reaches
+# the cluster is these defaults with the real account, cluster and ARNs on top.
+#
+# That handoff is the point. The alternative is hand-copying ARNs from Terraform output into
+# manifests, which is where a stack like this drifts: the IAM role in the manifest and the role
+# Terraform created diverge, and the symptom is an agent that cannot assume a role that exists.
+#
+# The placeholders below are deliberately invalid rather than plausible. A chart rendered without
+# the Terraform values file should fail to produce a working agent, not quietly produce one
+# pointing at account 000000000000.
+
+# Written by Terraform. Do not set by hand.
+accountId: "ACCOUNT_ID_NOT_SET"
+region: "REGION_NOT_SET"
+cluster: "CLUSTER_NOT_SET"
+partition: aws
+
+# The EKS Capabilities, which EKS runs off-cluster. Written by Terraform.
+#
+# kro's role name is needed to grant it Kubernetes RBAC. The capability arrives able to watch
+# ResourceGraphDefinitions and nothing else: it cannot create the resources an RGD composes, and it
+# cannot watch the custom kind the RGD defines. Leaving this empty renders no binding, and the
+# agent resource definition then sits Inactive with ControllerReady=False and a cache sync timeout,
+# which looks like everything worked. See templates/35-kro-rbac.yaml.
+capabilities:
+  kro:
+    roleName: ""
+  ack:
+    roleName: ""
+
+# "open-source" or "aws-services". Decides which egress shape is rendered: the in-cluster gateway
+# namespace peer, or the AgentCore Gateway hostname.
+path: "open-source"
+
+oidcIssuerUrl: ""
+
+namespaces:
+  # The reasoning tier. Enrolled in the mesh when mesh.mode is ambient.
+  reasoning: agents
+  # The execution tier. Never enrolled in the mesh: its pods have no network device to capture.
+  execution: agents-execution
+  # The ingress browser-gated routes and their ListenerRuleConfigurations, when
+  # ingress.enabled. Platform-owned and holding no pods but the secret syncer: not an agent
+  # namespace, so the sandbox admission policy does not bind here. It exists so the one credential
+  # a browser gate can need -- a direct OIDC client secret -- and the one RBAC grant that lets EKS
+  # Auto Mode's managed controller read it live in exactly one place, never in an agent namespace.
+  ingress: ingress
+  # The evaluation runner, when evals.enabled. Platform-owned, not an agent namespace: the sandbox
+  # admission policy does not bind here and no agent runs here. Its pods hold the judge's identity
+  # at the gateway and, for the experiment, a token per agent they run cases against.
+  evals: agent-evals
+
+# A default StorageClass. EKS Auto Mode installs the EBS CSI driver and does NOT create one, so
+# without this every PersistentVolumeClaim on the cluster stays Pending -- including the workspace
+# volume behind Agent Sandbox suspend and resume, which is the feature that needs it most.
+#
+# Set create to false if the cluster already has a default class.
+storageClass:
+  create: true
+  name: eks-agents-gp3
+  default: true
+  # Customer-managed KMS key for volume encryption. Empty uses the account's EBS default key;
+  # encryption itself is always on.
+  kmsKeyId: ""
+
+networkPolicy:
+  # The `kubernetes` Service's ClusterIP, the one destination an Agent with needsClusterApi gets
+  # beyond the rest (40-agent-rgd.yaml clusterApiPolicy, and the Admin tier's eks-agents-cluster-api).
+  # Rendered by Terraform from the cluster's service CIDR; empty composes no rule, and the token
+  # needsClusterApi mounts then has no route to the API.
+  kubernetesApiServiceIp: ""
+
+  # Where an agent may send DNS: the resolver ranges, not the internet. Port 53 to any address would
+  # let a pod query a resolver of its own choosing on a public address, which is a channel out of the
+  # cluster that no other rule here sees. Every resolver an EKS pod uses is in one of these: the
+  # kube-dns ClusterIP (10.100.0.0/16 or 172.20.0.0/16), CoreDNS on the node's own VPC address on
+  # EKS Auto Mode, a node-local cache on link-local, or the VPC resolver at VPC+2 or
+  # 169.254.169.253. Add your VPC CIDR here if it is outside RFC 1918 and 100.64.0.0/10.
+  #
+  # This narrows the destination, not the content: a name resolved through the cluster's resolver
+  # still reaches the internet's DNS, so a DNS tunnel through it remains possible.
+  dnsDestinations:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 100.64.0.0/10
+    - 169.254.0.0/16
+
+  # OPT-IN: end the reasoning namespace's Admin tier with a Deny, so the Accepts in
+  # 30-cluster-egress-policy.yaml are the whole reachable set and a namespaced policy a tenant can
+  # edit cannot widen it. Off by default because some egress is otherwise admitted below the Admin
+  # tier rather than in it -- the chat UI's fetch of the ALB signing key is one -- and turning this on
+  # without a live check would cut those. With it on, the Admin tier also Accepts the memory-ladder
+  # endpoints and the ALB key host, so the shipped configuration keeps working; run
+  # scripts/exercise.sh on a cluster before relying on it.
+  adminTierDefaultDeny: false
+
+  # AWS service endpoints the agent calls with its own credentials.
+  #
+  # Permitting the Pod Identity endpoint is not enough: it hands the agent a session, and without a
+  # rule naming a service there is nothing the session can be spent on there: the call times out
+  # from an agent pod while the credential endpoint answers.
+  #
+  # Empty by default. The checkpoint bucket and STS get their own rule from storage.checkpointBucket
+  # (enable_checkpoints), and the task queues, person access and memory endpoints from their own
+  # values. Add a service here when an agent calls it directly; anything reached through the gateway
+  # does not belong in this list. Entries are {name, hosts}.
+  #
+  # Set the region to match: a wildcard host here would widen the boundary to every region.
+  # S3's host is BUCKET-SPECIFIC. Virtual-hosted-style addressing means a request for a bucket goes
+  # to <bucket>.s3.<region>.amazonaws.com, so a rule naming only s3.<region>.amazonaws.com matches
+  # nothing and the call hangs.
+  awsServiceEndpoints: []
+
+  # Where an Agent with mcpAudience may connect: the namespace the MCP server runs in
+  # (gitops/examples/mcp-server) and its port. Composed per agent, only for agents that set it.
+  mcpServers:
+    namespace: mcp-servers
+    port: 8080
+
+  # In-cluster destinations an agent may reach, beyond the gateway and the collector.
+  #
+  # THERE IS NO IMPLICIT EAST-WEST ALLOWANCE. This policy's rules are the agent's whole reachable
+  # set, so a Service in another namespace is unreachable until it is named here -- and the symptom
+  # is a connect timeout to a name that resolves perfectly well.
+  #
+  # These are the OPEN SOURCE memory ladder's in-cluster Services. They are listed by default because
+  # a rule for a Service nobody deployed matches nothing, while a missing one is a connect timeout
+  # against a name that resolves. The aws-services root renders an empty list: its memory is managed
+  # services reached by hostname, with no in-cluster namespace to name.
+  inClusterDestinations:
+    # Named for the Service the valkey chart creates, not for the Application: the release is
+    # `agent-session-state` and the chart appends `-valkey-primary` and `-valkey-replicas`.
+    - name: agent-session-state-valkey-primary
+      namespace: agent-memory
+      ports: [6379]
+    - name: agent-session-state-valkey-replicas
+      namespace: agent-memory
+      ports: [6379]
+
+    # Rung 2 of the memory ladder: the semantic-recall vector store.
+    #
+    # Here by default even though rung 2 is opt-in, and that is deliberate. An agent that cannot
+    # reach the store gets a CONNECT TIMEOUT against a name that resolves perfectly well, with
+    # pgvector answering similarity queries from inside its own pod and the agent unable to open a
+    # socket to it. A rule for a service nobody deployed matches nothing and costs nothing; a
+    # missing rule is a silent timeout.
+    #
+    # The three CloudNativePG Services are `-rw`, `-ro` and `-r`: writes, reads, and any instance.
+    # Named by prefix below because an agent doing retrieval uses `-ro` and one writing a memory
+    # uses `-rw`, and getting half of that right is the same silence as getting none of it.
+    - name: agent-semantic-recall-cluster-rw
+      namespace: agent-memory
+      ports: [5432]
+    - name: agent-semantic-recall-cluster-ro
+      namespace: agent-memory
+      ports: [5432]
+
+  # May a workload reach the cluster's OIDC issuer to verify a caller's token?
+  #
+  # On by default, because every serving workload here verifies inbound JWTs and the issuer is a
+  # public hostname. Without it the verification fails closed and every authenticated request is
+  # refused -- inbound auth needs outbound reachability, which is easy to miss.
+  allowOidcIssuer: true
+
+  # May a pod in the reasoning namespace reach another pod there?
+  #
+  # The ingress rules accept the reasoning namespace, and that is only half of a connection: the
+  # source needs an egress allow too. Without this the chat UI cannot reach an agent, and an agent
+  # cannot reach its own Service; the symptom is ConnectTimeout to a name that resolves perfectly
+  # well. Set false where nothing in the namespace calls an agent there.
+  allowSameNamespace: true
+
+  # NO healthProbeCidr KEY, deliberately.
+  #
+  # These policies do not deny the kubelet's probes, so no CIDR needs allowing for them. A probed
+  # pod is Ready under both the Admin-tier ClusterNetworkPolicy and the
+  # namespaced ApplicationNetworkPolicy, and stops being Ready the moment the namespace is enrolled
+  # in the Istio ambient mesh. The cause is mesh capture, and the answer is an exec probe -- see
+  # gitops/examples/mcp-server.
+
+  # Namespaces whose pods must keep working on a DefaultDeny node, accepted at Admin-tier priority 1.
+  #
+  # The agents' nodes run in strict enforcement mode (see nodeClass below), where a pod no policy
+  # selects is denied in both directions. The pool is tainted, so the only pods that land there
+  # besides the agents are DaemonSets and the few workloads that tolerate the taint on purpose:
+  #
+  #   kube-system    the node's own DaemonSets: the VPC CNI, kube-proxy and the Pod Identity agent
+  #                  where they run as pods, and the CSI node plugins.
+  #   istio-system   ztunnel and istio-cni. Without this, ztunnel cannot reach istiod and cannot be
+  #                  probed, so the mesh carries nothing on the one node that matters.
+  #   monitoring     the netpol-verdicts DaemonSet (open-source path), which runs only on these
+  #                  nodes and is scraped by Prometheus.
+  #
+  # Every other platform namespace (the gateway, the sandbox controller, KEDA, CloudNativePG,
+  # Langfuse, session state) runs only on general-purpose nodes, in standard mode, where a pod no
+  # policy selects already accepts and sends traffic. Listing them here would add nothing they need
+  # and would override their own policies: an Admin-tier Accept ends evaluation, so the session-state
+  # chart's NetworkPolicy (gitops/platform/open-source/templates/60-memory.yaml), which admits only
+  # the agents namespace and valkey's own pods on 6379, would be inert. A component that has to run
+  # on the agents' nodes is the case for adding a namespace.
+  #
+  # NEVER PUT AN AGENT NAMESPACE HERE. It would hand every agent unrestricted egress and make the
+  # boundary this stack is built on decorative; scripts/validate.sh refuses the overlap.
+  infrastructureNamespaces:
+    - kube-system
+    - istio-system
+    - monitoring
+
+  # THE SWITCH FOR THIS WHOLE LAYER, and the first of the three the platform layers on.
+  #
+  # false removes the enforcement ConfigMap, both policy tiers and the per-agent policy the Agent
+  # resource composes -- so an agent namespace has no egress boundary at all and an agent can reach
+  # anything the node can. That is a deliberate configuration for a cluster where something else
+  # provides the boundary, and it is the wrong default for everything else, which is why it is true.
+  #
+  # Turning it off does NOT make the gateway pointless, and turning the gateway off does not make
+  # this pointless: the two layers are independent, and the agents page of the EKS User Guide has
+  # the four combinations. What it does remove is the property that makes the gateway UNAVOIDABLE.
+  # Without this layer an agent that ignores the endpoint it was handed reaches the model provider
+  # directly.
+  enabled: true
+
+  # Render the cluster-scoped ClusterNetworkPolicies (templates/30-cluster-egress-policy.yaml). Its
+  # field names are the shipped ClusterNetworkPolicy CRD's; on a different platform version, check
+  # them with `kubectl explain clusternetworkpolicy.spec.egress --recursive`.
+  clusterScoped: true
+
+  # Render the namespaced ApplicationNetworkPolicy equivalent, whose schema is from the EKS User
+  # Guide's own worked example. On by default even when clusterScoped is true, for defence in depth
+  # on the destinations the cluster tier does NOT name.
+  #
+  # Be clear about what this second tier does and does not buy, because it is easy to read
+  # backwards. An Admin-tier `Accept` in the cluster-scoped policy ENDS EVALUATION, so this policy
+  # cannot narrow a destination that one already permits. What it does is deny by default everything
+  # the cluster tier leaves unnamed, which is the larger set, and it is the tier a platform team
+  # uses to restrict one namespace to a subset. The two tiers are layered, not independent.
+  namespaced: true
+
+
+  # --- the agents' own nodes ---------------------------------------------------
+#
+# WHY THIS IS A NODECLASS AND NOT A RUNBOOK STEP. `networkPolicy` selects the node agent's
+# enforcement mode and the mode is read when a NODE BOOTS, so it cannot be patched onto running
+# nodes: a cluster whose NodeClass says DefaultDeny while every node booted DefaultAllow reads as
+# hardened and enforces nothing of the sort. The agents' nodes therefore have to be launched from a
+# NodeClass that already says it, which means this belongs in the templates.
+#
+# In standard mode (DefaultAllow) a new pod's traffic is not enforced until its policies are
+# programmed, so a pod can reach a destination no policy permits in the moments after it starts.
+# Strict mode (DefaultDeny) closes that window.
+nodeClass:
+  # Rendering requires roleName, which Terraform supplies. On a cluster where you brought your own
+  # nodes, set this false and apply DefaultDeny to whichever NodeClass the agents run on yourself --
+  # and then confirm the nodes were REPLACED, because the setting does not reach a running node.
+  enabled: true
+  name: eks-agents
+
+  # From terraform-values.yaml. Empty disables rendering rather than producing a NodeClass the API
+  # rejects for a missing role.
+  roleName: ""
+  subnetIds: []
+  securityGroupIds: []
+
+  # The point of the object. DefaultAllow is the cluster default and leaves the startup window open.
+  networkPolicy: DefaultDeny
+  networkPolicyEventLogs: Enabled
+
+  # Nothing lands here unless it tolerates this, which the agent resource definition does. A
+  # workload that is not an agent has no business on a node where an unselected pod loses DNS.
+  taintKey: eks-agents/dedicated
+
+  capacityTypes: ["on-demand"]
+  instanceCategories: ["c", "m", "r"]
+
+  snatPolicy: Random
+  ephemeralStorage: {}
+  expireAfter: 336h
+  terminationGracePeriod: 24h0m0s
+  consolidationPolicy: WhenEmptyOrUnderutilized
+  consolidateAfter: 1m
+  limits: {}
+
+mesh:
+  # The one variable that decides the mesh configuration: none or ambient.
+  #
+  #   none      The default, on both paths. No mesh. Egress still fails closed, because the network
+  #             policy makes the gateway the only reachable destination -- but pointing an agent at
+  #             the gateway is a convention the agent could ignore rather than something it cannot
+  #             evade. Correct when every agent on the cluster is one the platform team builds or
+  #             packages.
+  #
+  #   ambient   One proxy per node, enrolling the reasoning namespace. Traffic of an unsandboxed pod
+  #             is captured below the workload, and the pod holds no mesh key; a pod in a Nitro
+  #             sandbox isn't captured.
+  #
+  # There is no sidecar mode: an agent's namespace enforces Pod Security restricted, which refuses
+  # istio-init, and a sidecar would put a mesh key in the pod. Istio resolves a namespace labelled
+  # for both data planes in favour of sidecar, so scripts/validate.sh refuses a rendered agent
+  # namespace carrying istio-injection.
+  #
+  # The agents-mesh page of the EKS User Guide compares the two, including which agent archetypes
+  # point at which.
+  mode: none
+
+  # The SPIFFE trust domain the mesh's certificate authority issues under. A per-cluster domain, so
+  # an identity under it means nothing outside this cluster.
+  trustDomain: cluster.local
+
+  # Which agents may connect to which, on the mesh identity. Without this the mesh authenticates
+  # both ends of every in-cluster call and then allows it, so two agents on one cluster can call
+  # each other with neither the network policy nor the gateway in the path.
+  #
+  # Inert when mesh.mode is none: a policy written against Istio's CRDs with no data plane in the
+  # path is accepted by the API server and enforces nothing.
+  authz:
+    # May only the agents namespace reach the gateway, enforced by the mesh?
+    #
+    # FALSE by default because it CANNOT WORK while agents are sandboxed, and when it is on it does
+    # not merely fail to protect -- it refuses every model call. Istio derives `source.namespaces`
+    # from the caller's mTLS principal and a Nitro sandbox pod presents none, so the rule matches
+    # nothing and an ALLOW policy that matches nothing denies everything. See the long note in
+    # templates/50-mesh-authz.yaml.
+    #
+    # Set true only where agents run without the sandbox runtime class, which is the case the policy
+    # was written for and where the caller does present an identity.
+    gatewayAllowAgentsOnly: false
+
+    enabled: true
+
+    # Admit the Gateway API load balancer to the agents' own port. Required when ingress.enabled
+    # is true -- the ALB targets pods directly and that traffic enters from outside the mesh, so the
+    # namespace-wide deny would otherwise make every agent unreachable through ingress and
+    # reachable by nothing else.
+    allowIngress: true
+    ingressPorts: [8080]
+
+    # The waypoint's service account, if the namespace is enrolled with one.
+    #
+    # Required then, and a hard outage if forgotten. A waypoint terminates the connection, so the
+    # destination ztunnel sees the waypoint's identity rather than the caller's and every
+    # per-caller rule above stops matching. Setting it adds the waypoint to those allows; the
+    # per-caller decision then belongs on a policy attached to the waypoint with targetRefs, which
+    # is where it has to live anyway because those rows are all L7.
+    #
+    # istioctl names the waypoint's service account after the Gateway, so a waypoint created as
+    # `agents-waypoint` has the service account `agents-waypoint`.
+    #
+    # Only applies when mesh.mode is ambient.
+    waypointServiceAccount: ""
+
+memory:
+  # Session state's IAM identity on the aws-services path. Both are needed for the
+  # elasticache:Connect grant in the agent's policy -- granting one without the other fails at
+  # connect time with an error that does not say which half is missing. Empty on the open source
+  # path, where session state is an in-cluster valkey with a password instead.
+  sessionStateUserArn: ""
+  sessionStateCacheArn: ""
+  # Rungs 2 and 3 on the aws-services path, written by Terraform when enable_semantic_recall and
+  # enable_consolidation are on. Each one, when set, gives every Agent the IAM grant, the endpoint
+  # environment variable and the egress rule it needs; empty renders none of the three.
+  vectorBucketArn: ""
+  # The index names in that bucket, comma-separated (semantic_recall_indexes keys). An agent's role
+  # cannot list indexes, so this is how it learns them.
+  vectorIndexes: ""
+  memoryId: ""
+  # The strategies' namespace templates, comma-separated, e.g. /agents/{actorId}/{sessionId}. Records
+  # are listed by exact namespace, so an agent has to know where its strategy writes them.
+  memoryNamespaces: ""
+  # Rung 3 on the OPEN SOURCE path: Mem0 as a library inside the agent, on the pgvector tier.
+  # Written by Terraform when enable_consolidation is on. dbSecretArn set gives every Agent the
+  # Secrets Manager read on the memory tier's login, the egress rule for Secrets Manager, an
+  # embeddings route on the gateway, and the AGENT_CONSOLIDATION_* environment; empty renders none.
+  consolidation:
+    dbSecretArn: ""
+    # The CloudNativePG read-write Service and database 61-semantic-recall.yaml creates.
+    dbHost: agent-semantic-recall-cluster-rw.agent-memory.svc.cluster.local
+    dbName: agentmemory
+    embeddingModelId: amazon.titan-embed-text-v2:0
+    embeddingDims: 1024
+  # Where the agent finds its session state, as host:port.
+  #
+  # The agent reads SESSION_STATE_ENDPOINT, so without it rung 1 of the memory ladder is on by
+  # default with no agent able to find it. Same shape as the OTLP endpoint: the component deployed,
+  # the contract documented, and nothing connecting the two.
+  #
+  # Open source: the Valkey Service the memory Application creates.
+  # AWS services: the ElastiCache endpoint, from the session_state_endpoint Terraform output.
+  #
+  # Leave empty to run an agent with no session state, which means one replica or no affinity --
+  # see the agents-memory page of the EKS User Guide.
+  #
+  # DEFAULTED, so a session store the open source path deploys is one every agent can find. An
+  # empty value would leave the store running and no agent with its address, while the examples
+  # run `replicas: 2`, the configuration that needs it; the agent then logs
+  # "SESSION_STATE_ENDPOINT is not set; session state is off for this agent".
+  #
+  # The value is the Service the valkey chart actually creates: release `agent-session-state` in
+  # `replication` architecture, whose primary is `<release>-valkey-primary`. On the AWS services
+  # path this is overridden with the ElastiCache endpoint from Terraform.
+  sessionStateEndpoint: agent-session-state-valkey-primary.agent-memory.svc.cluster.local:6379
+
+observability:
+  # Whether a telemetry collector is installed. Set from Terraform's enable_observability, which also
+  # decides whether the collector, the metrics backend and the dashboards are synced at all -- set it
+  # there, not here. Off: an agent is given no OTLP endpoint and OTEL_SDK_DISABLED=true, so its SDK
+  # neither exports nor falls back to localhost:4318, and no policy names a collector namespace.
+  enabled: true
+
+  # The namespace the collector runs in, which the egress policy has to permit. The agent's
+  # reachable set is exactly what that policy names, and the collector is not the gateway -- so
+  # without this, OTLP export times out and every span and metric is dropped silently.
+  collectorNamespace: monitoring
+
+  # Where the agent sends its OpenTelemetry. REQUIRED in effect, even though it has a default:
+  # with no OTEL_EXPORTER_OTLP_ENDPOINT the SDK falls back to http://localhost:4318, which is
+  # nothing inside an agent pod, so every span and metric is dropped and the dashboard is empty
+  # while the collector, Prometheus and Grafana all report healthy.
+  #
+  # With this unset, the agent completes a model call and no gen_ai_* series ever reaches the
+  # collector.
+  #
+  # Left empty, the agent resource picks the collector each path ships:
+  #   open-source   opentelemetry-collector.monitoring
+  #   aws-services  adot-collector in the operator's namespace
+  otlpEndpoint: ""
+
+gateway:
+  # THE SWITCH FOR THE SECOND LAYER.
+  #
+  # true  every model and tool call goes through the egress gateway. The network policy names the
+  #       gateway namespace as the one destination for them, agents are handed AGENT_GATEWAY_URL
+  #       and the OpenAI-dialect variables that point at it, and the gateway holds the credentials.
+  # false no gateway is deployed, and agents call Amazon Bedrock directly with their own Pod
+  #       Identity credential. The network policy then permits `bedrock-runtime` instead of the
+  #       gateway namespace, and no gateway URL is injected.
+  #
+  # ON THE OPEN SOURCE PATH, false ALSO REMOVES THREE ARGO CD APPLICATIONS -- the agentgateway CRDs,
+  # the controller and its configuration. That is not something this chart can do, because they are
+  # separate Applications and two of them install upstream charts: a chart cannot decline to be
+  # installed. Terraform renders the root Application's `directory.exclude` from this value, so the
+  # files are not synced at all. Set it through Terraform's `enable_gateway`, not by hand here --
+  # editing only this value leaves the gateway running and unreferenced.
+  #
+  # WITH THIS OFF THE DEFAULT AGENT IMAGE DOES NOT START. agents/reasoning reaches a model only
+  # through the gateway. agents/reasoning-direct -- the same agent, built with
+  # MODEL_ROUTE=bedrock-direct -- calls Bedrock's own API on the agent's role, giving up everything
+  # the gateway provides. The agents-application-setup page of the EKS User Guide covers the two
+  # images.
+  enabled: true
+
+  # Open source path: the namespace AgentGateway runs in, named as a network policy peer.
+  namespace: agentgateway-system
+
+  # The DATA PLANE Service name, which is not the controller's.
+  #
+  # Getting this wrong is a timeout, not an error. AgentGateway's controller runs a Service called
+  # "agentgateway" that serves xDS and metrics on 9977/9092/9093; the thing an agent sends a model
+  # call to is the Service the controller materialises from the Gateway object, which takes the
+  # GATEWAY's name. So this has to equal the Gateway name in
+  # gitops/charts/agentgateway-config/templates/00-gateway.yaml, and nothing on the cluster
+  # validates that the two agree -- scripts/validate.sh does.
+  #
+  # An agent pointed at agentgateway:8080 gets ConnectTimeout, because no port on the controller's
+  # Service serves 8080.
+  # The Gateway OBJECT's name, as distinct from serviceName above which is the Service the data
+  # plane runs behind. The agent resource definition attaches each agent's model route to this
+  # Gateway's `egress` listener.
+  name: egress
+  serviceName: egress
+  port: 8080
+
+  # The gateway's own IAM role, which every composed agent must allow to assume it.
+  #
+  # REQUIRED FOR A MODEL CALL ON THE OPEN SOURCE PATH. The gateway signs each call as the calling
+  # agent, which means assuming that agent's role -- and a role composed with only the Pod Identity
+  # principal refuses it. The gateway then returns 502 "backend authentication failed" and logs
+  # "STS refused to grant assume role ... not authorized to perform: sts:TagSession".
+  #
+  # Hand-editing the role does not survive: ACK owns it and reverts the trust policy on its next
+  # reconcile, so the statement has to be rendered here. A manual edit works until the next
+  # reconcile and then the model path breaks again.
+  #
+  # From the gateway_role_arn output of terraform/modules/egress-agentgateway. Leave empty on the
+  # AWS services path, where AgentCore has its own execution role and assumes the agent role
+  # through its own configuration.
+  roleArn: ""
+  # AWS services path: the AgentCore Gateway hostname, from the gateway_hostname Terraform output.
+  # This is the egress policy's single permitted destination, so it is a hostname, not a URL.
+  hostname: ""
+
+  # The two endpoints an agent is configured with. One gateway serves tools and models on different
+  # paths, and they are not interchangeable: a model call is an OpenAI-compatible POST, a tool call
+  # is MCP. Both are rendered by Terraform.
+  #
+  # modelEndpoint is REQUIRED on the aws-services path and comes from the model_endpoint output. It
+  # is empty unless the gateway has an inference target, and an agent without it has nowhere to
+  # send a model call -- the egress policy permits the gateway and nothing else.
+  #
+  # On the open source path both are derived from the in-cluster gateway Service instead, so these
+  # stay empty there.
+  modelEndpoint: ""
+  mcpEndpoint: ""
+
+  # The audience the agent's projected token names, and what the gateway checks it against. The
+  # agent presents this token and nothing else; the gateway reads the identity off it and assumes
+  # the agent's own IAM role to sign the call.
+  #
+  # It has to match on both sides or every model call fails closed for an unverifiable identity:
+  # gateway.audience in ../charts/agentgateway-config/values.yaml on the open source path, and the
+  # gateway_audiences Terraform variable on the AWS services path. A mismatch is the one
+  # misconfiguration here that produces no object-level error anywhere -- the pod is Running, the
+  # policies are Accepted, and the requests are rejected.
+  audience: agentgateway
+
+# ---------------------------------------------------------------------------
+# The operator chat UI
+# ---------------------------------------------------------------------------
+#
+# The one service in these templates a PERSON reaches. Off by default: an agent reached only by
+# other agents or by a schedule needs no chat window, and this one is a door into an agent's
+# authority.
+#
+# Applied by hand it would need four edits -- image, Region, hostname, identity provider -- each of
+# which can go wrong in ways that only appear at runtime. Everything it needs is already a value
+# here, so it is rendered.
+chatUi:
+  enabled: false
+
+  name: chat-ui
+  port: 8080
+  replicas: 2
+
+  # The tag of the image `registry` names. Build it with scripts/build-images.sh.
+  imageTag: v1
+
+  # The hostname is `<this>.<ingress.domainName>`, so there is no placeholder to replace and no
+  # name the listener certificate does not cover.
+  hostnamePrefix: chat
+
+  # The agents this UI offers. Each one gets its own projected token source, because a token names
+  # exactly ONE audience and each agent verifies its own name.
+  #
+  # THE UI CALLS AGENTS WITH ITS OWN IDENTITY, not the person's. The person's claims travel as
+  # context for the audit trail; the agent's own role bounds what the turn can do, whoever asked.
+  # So anyone allowed to use this UI can cause anything these agents' roles permit.
+  agents:
+    - research
+
+# The agents' shared ingress, as Gateway API rather than Ingress.
+#
+# One load balancer for every agent that attaches a route: a Gateway IS a load balancer, so a
+# Gateway per agent would be an ALB per agent.
+#
+# Off by default, because it provisions a load balancer and needs a certificate. An agent reached
+# only by another agent or by a schedule needs none of this -- it sets expose: cluster, or nothing.
+ingress:
+  enabled: false
+
+  namespace: agents
+  gatewayClassName: eks-auto-alb
+  gatewayName: agent-ingress
+
+  # Required when enabled. The ACM certificate has to cover every hostname an agent's route claims;
+  # the listener is HTTPS only, so there is no plaintext path to misconfigure.
+  #
+  # It is carried on the LoadBalancerConfiguration, not on the Gateway listener's `tls`: the
+  # controller marks both `ListenerTLSConfig - CertificateRefs` and `- Options` unsupported, so a
+  # certificate named there is not read and the listener comes up with none.
+  certificateArn: ""
+
+  # The ARN of an AWS WAF web ACL to put in front of the load balancer, from enable_ingress_waf.
+  # Empty attaches none.
+  wafWebAclArn: ""
+
+  # The DNS suffix agents are reached at. An agent's route claims `<agent>.<this>` unless it sets
+  # routeHostname, and the certificate above has to cover that name.
+  domainName: ""
+
+  # THE IDENTITY PROVIDER IS THE PLATFORM'S, NOT THE AGENT'S.
+  #
+  # Set these and every agent with `expose: route` gets an authenticated route, because the resource
+  # that would serve an unauthenticated one is not rendered at all. Leave them empty only where
+  # something in front has already authenticated the caller -- an agent's route is then open to
+  # anything that can reach the load balancer.
+  oidc:
+    issuer: ""
+    authorizationEndpoint: ""
+    tokenEndpoint: ""
+    userInfoEndpoint: ""
+
+  # The Kubernetes Secret holding the direct OIDC client id and secret, in namespaces.ingress --
+  # the only namespace any `authenticate-oidc` rule lives in. Keys `clientID` and `clientSecret`.
+  # The value never passes through these values or through Git: terraform/modules/platform-secrets
+  # writes it to Secrets Manager and gitops/charts/platform-secrets syncs it into the cluster.
+  #
+  # ONLY THE `authenticate-oidc` ACTION USES IT. The Cognito action reads its client secret from the
+  # user pool itself, so with ingress.cognito set there is no Secret.
+  oidcSecretName: "ingress-oidc"
+
+  # THREE BROWSER GATES, chosen by which of ingress.cognito and ingress.oidc Terraform fills:
+  #
+  #   cognito set              authenticate-cognito, the pool's users or a provider federated into it
+  #   oidc set, cognito empty  authenticate-oidc, the provider called directly (ingress_idp =
+  #                            "oidc-direct"), plus 47-ingress-oidc.yaml's grant
+  #   neither                  no gate: the unauthenticated route, for a cluster whose callers were
+  #                            authenticated in front of it
+  #
+  # DIRECT OIDC NEEDS ONE GRANT ON EKS AUTO MODE. The managed gateway controller reads the client
+  # secret as the AWSServiceRoleForAmazonEKS service-linked role, whose access policies grant no
+  # Secret access. Without the grant a ListenerRuleConfiguration carrying `authenticate-oidc` gets
+  # NO status at all, the route is rejected with `IncompatibleFilters ... status unknown`, and the
+  # load balancer serves a fixed-response 500. AWS documents the remedy:
+  # a namespaced Role bound to the group `eks:managed`, which the service-linked role's access entry
+  # declares (https://docs.aws.amazon.com/eks/latest/userguide/auto-managed-rbac.html). On Gateway
+  # API, `get` on the one named Secret takes the rule to `accepted: true`.
+  # WHAT HAPPENS TO AN UNAUTHENTICATED CALLER: `deny`, `authenticate` or `allow`.
+  #
+  # `deny` returns HTTP 401 and is right for a machine caller and for failing closed -- including
+  # when the identity provider is unreachable, which is the one moment it matters. The response is
+  # `server: awselb/2.0`, 401, no WWW-Authenticate header, no redirect.
+  #
+  # `authenticate` redirects the caller to the provider's authorization endpoint, which is what a
+  # PERSON AT A BROWSER needs -- a 401 gives them no way to log in. Use it for a route that serves a
+  # human interface, such as the chat UI, and keep `deny` for an agent's own API.
+  #
+  # `allow` passes an unauthenticated request through to the agent. There is no configuration of
+  # this stack in which that is correct.
+  onUnauthenticatedRequest: deny
+
+  # The CIDRs the load balancer's ENIs sit in, normally the private subnets Terraform used.
+  #
+  # AN EXPOSED AGENT IS UNREACHABLE WITHOUT THESE. An `ip` target group health-checks and forwards
+  # to the pod IP from the load balancer's own ENIs, which are VPC addresses rather than pods -- and
+  # the agent's namespaced policy selects the pod for Ingress, so with nothing naming those
+  # addresses every inbound connection is dropped. The symptom is not a policy error: the Gateway is
+  # Programmed, the route is Accepted, the rule is right, and the target sits
+  # `unhealthy / Target.Timeout` while callers get a 504.
+  #
+  # `ipBlock` is the only source that can say this -- the policy API's `from` takes ipBlock,
+  # namespaceSelector or podSelector, and a load balancer is neither of the last two. Narrow it to
+  # the load balancer's subnets rather than the whole VPC.
+  loadBalancerCidrs: []
+
+  # WHO THE ROUTE IS FOR: `browser` or `workload`. Per agent on its own resource; this is the
+  # default for an agent that does not say.
+  #
+  # `browser` runs the OIDC/Cognito flow at the load balancer, which is a redirect -- right for a
+  # person, useless to anything else: a machine caller holding a perfectly valid projected token
+  # gets a 302 to the authorization endpoint and can go no further.
+  #
+  # `workload` validates the caller's PROJECTED SERVICE ACCOUNT TOKEN at the load balancer against
+  # the cluster's own OIDC issuer, with the subject and audience named as claims. A valid token
+  # reaches the agent; no token and a malformed token are refused at the load balancer with 401, and
+  # a DIFFERENT service account's token is refused even with the right audience. This is what an MCP
+  # client, a peer
+  # agent or a schedule needs, and it is the only one of the two that gates a non-browser caller.
+  routeAuth: browser
+
+  # The ports an ingress load balancer may reach on a workload labelled
+  # `eks-agents/ingress: "true"` -- the chat UI, an MCP server, anything exposed that this chart
+  # does not compose. An `Agent` does not need its port listed here: its own composed policy names
+  # `spec.port` exactly.
+  exposedPorts: [8080]
+
+  # The path the load balancer health-checks an agent on.
+  #
+  # THE DEFAULT IS `/` AND THE REFERENCE AGENT ANSWERS 404 THERE, so without this every exposed
+  # agent's target is unhealthy and a caller past the gate gets a 504; the agent logs each health
+  # check as `GET / HTTP/1.1 404`.
+  #
+  # The EKS best practices guide recommends an ELB health check as a layer independent of the
+  # kubelet's; on this stack it is not optional, because an agent's kubelet probe is an exec probe
+  # (see agentResource.healthProbe) and `exec` probes are invisible to the load balancer.
+  healthCheckPath: /healthz
+
+  cognito:
+    userPoolArn: ""
+    userPoolClientId: ""
+    # The domain PREFIX, not the hostname: `my-pool`, not `my-pool.auth.<region>.amazoncognito.com`.
+    userPoolDomain: ""
+    # The federated OIDC provider's name in the pool, when Terraform's ingress_idp is "oidc".
+    # The listener rule passes it as `identity_provider`, so the hosted UI redirects straight to that
+    # provider instead of showing a sign-in page with one button on it. Empty for the pool's own users.
+    identityProvider: ""
+
+  # internal, and changing it is a decision with a different review. Terraform's internet-facing
+  # option (ingress_scheme) is allowlisted: it sets securityGroupIds to a group admitting HTTPS from
+  # ingress_allowed_cidrs only, and subnetIds to the public subnets. An agent reachable from the
+  # internet is the same exposure as a managed endpoint left public, and the egress controls say
+  # nothing about what reaches an agent. It sits on the GatewayClass rather than on an agent's own
+  # object so that an agent author cannot change it.
+  scheme: internal
+
+  # Emit the AWS LoadBalancerConfiguration carrying scheme, subnets, security groups and access
+  # logs. This is where the Ingress annotations went: a typed resource a platform team reviews,
+  # where a misspelled field is a schema error rather than an annotation silently ignored.
+  loadBalancerConfiguration: true
+
+  # Empty lets Auto Mode choose by subnet tag. Name them explicitly to pin ingress to the
+  # subnets the organization intends, which is part of being inside its data perimeter.
+  subnetIds: []
+  securityGroupIds: []
+
+  # Past a plausible agent turn. The default is 60 seconds, shorter than many turns, and this raises
+  # a limit rather than removing one.
+  idleTimeoutSeconds: 900
+
+  # Who called the agent. The egress gateway's audit log does not carry this: it sees the agent
+  # calling out, not the person calling in.
+  accessLogBucket: ""
+
+storage:
+  checkpointBucket: ""
+
+# Agents that run as tasks (enable_agent_tasks; terraform/modules/agent-tasks). Rendered by
+# Terraform. With it on, KEDA is installed (gitops/platform/<path>/13-keda.yaml), an Agent in
+# `agents` may set runtime: tasks, and the agents' egress admits SQS.
+tasks:
+  enabled: false
+  # The agents that have queues: <cluster>-<agent>-tasks, -tasks-dlq and -results.
+  agents: []
+  visibilityTimeoutSeconds: 300
+  pollingIntervalSeconds: 10
+  triggerAuthentication: eks-agents-sqs
+
+# Acting with a person's own authority (enable_person_access; terraform/modules/person-access).
+# Rendered by Terraform. With it on, every agent pod gets the person role and bucket, the agents'
+# egress admits STS and that bucket, and the chat UI forwards a signed-in person's access token.
+personAccess:
+  enabled: false
+  # The agents that have a person role (person_access_agents), and the role ARN up to the agent's
+  # name: an agent's role is <roleArnPrefix><agent>-person-data. An agent not listed gets an empty
+  # AGENT_PERSON_ROLE_ARN, so it cannot act with a person's authority.
+  agents: []
+  roleArnPrefix: ""
+  bucket: ""
+  issuer: ""
+  clientIds: []
+  # person_access_delegated_token. Open source: the gateway exchanges a person's access token for a
+  # delegated token on the MCP route; here only `enabled` is read, and it tells each agent to send
+  # the MCP endpoint an access token only. AWS services (mode agentcore): each listed agent makes
+  # the exchange itself with AgentCore Identity, on its own credential provider and workload
+  # identity, <resourcePrefix><agent>-on-behalf-of and <resourcePrefix><agent>, and sends the tool
+  # the delegated token for `audience`.
+  tokenExchange:
+    enabled: false
+    mode: ""
+    audience: ""
+    resourcePrefix: ""
+  # person_access_via_gateway: each listed agent gets AGENT_PERSON_S3_URL, its /aws/<agent>/s3 route.
+  viaGateway:
+    enabled: false
+
+agentResource:
+  # Render the kro ResourceGraphDefinition. Set false if the platform team creates per-agent AWS
+  # objects from Terraform instead; both owning the same agent's IAM role means two reconcilers
+  # fighting over a policy, and the symptom is permissions that flip between applies.
+  enabled: true
+
+  # The IAM path per-agent roles are created under. Must match the ACK capability role's own
+  # permissions, which are scoped to it: a role created outside this path is refused.
+  rolePath: /eks-agents/
+
+  # The health probe on an agent that serves (expose is not "none"; one that does not serves no
+  # HTTP and gets none). The contract is GET /healthz on the agent's port answering 200 once it can
+  # serve, which the reference agent meets.
+  #
+  #   handler: exec (default) | httpGet | none.
+  #            exec runs execCommand inside the container, so no connection is made and nothing can
+  #            capture it. httpGet needs nothing in the image but works ONLY where the agent
+  #            namespace is not in Istio ambient: on a sandboxed pod that ambient captures, the
+  #            kubelet's connection never gets its reply back from the Nitro guest, and liveness
+  #            restarts a healthy agent in a loop: the probe reports "context deadline exceeded"
+  #            while /healthz answers 200 inside the pod.
+  #            scripts/validate.sh refuses a rendered network probe on a sandboxed pod.
+  #   execCommand: what the exec probe runs; exit 0 means ready. It needs python3 in the image,
+  #            which the reference agent has. An image without it sets its own command here, or
+  #            handler: none. AGENT_PORT is the agent's port.
+  healthProbe:
+    handler: exec
+    execCommand:
+      - python3
+      - -c
+      - "import os, sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('AGENT_PORT', '8080') + '/healthz', timeout=3).status == 200 else 1)"
+
+  # Turns a minute an agent serves for each person a turn is for, counted in the agent's pod
+  # (apps/reference/server.py). The gateway's model budget is per agent, which every person behind
+  # it shares; this keeps one signed-in person from using it all. 0 is off.
+  turnsPerPersonPerMinute: 20
+
+  # The runtime an Agent gets when it does not name one: `sandbox` (an Agent Sandbox Sandbox, one
+  # pod, suspend and resume) or `deployment`. Sandbox is the sample's default; see the Sandbox
+  # resource in templates/40-agent-rgd.yaml for what it changes about scaling and updates.
+  defaultRuntime: sandbox
+
+  # The defaults for the Agent's sandbox network limit fields (templates/40-agent-rgd.yaml), which
+  # become the pod's sandbox.amazonaws.com/ annotations. Without them the Nitro sandbox applies its
+  # own: 100M bandwidth and 1500 packets/s each direction, 100 DNS packets/s, 4096 tracked
+  # connections. These are the EKS User Guide's pair for about 1 Gbit/s, with DNS and connections
+  # raised to match.
+  #
+  # Bandwidth and packets/s are separate buckets; raise them together. Values are read once, when
+  # the pod is created. scripts/validate.sh refuses a default the Agent's own field patterns would.
+  sandboxLimits:
+    networkBandwidth: "1G"             # bits/s each direction; k M G T Ki Mi Gi Ti, or "disabled"
+    networkPacketsPerSecond: "15000"   # each direction, or "disabled"
+    dnsQueriesPerSecond: "256"         # the service clamps at 512; or "disabled"
+    connectionLimit: 16384             # 64-65536; cannot be disabled
+
+  # Permission sets an Agent may name (spec.permissionSets), rendered by Terraform from
+  # agent_permission_sets: set name -> the namespaces it is offered to (empty: every agent
+  # namespace). The policies themselves are in IAM, under <rolePath>permission-sets/.
+  permissionSets: {}
+
+  # The permissions boundary every composed agent role is created inside, from the
+  # agent_permissions_boundary_arn Terraform output. It is the one control that survives a mistake
+  # in the resource definition itself.
+  permissionsBoundaryArn: ""
+
+admission:
+  # Deny, not Audit. An audit-mode admission policy on an agent platform records the pod it was
+  # there to refuse.
+  validationAction: Deny
+
+  # Accept confidential-sandbox as well as isolated-sandbox. Off: the admission policy admits
+  # isolated-sandbox only, which is the runtime class everything in this stack uses, so the
+  # policy names exactly what runs. A team that deliberately takes an agent to confidential mode,
+  # which is its own project, turns this on for that cluster.
+  allowConfidentialSandbox: false
+
+# THE MODEL BACKEND THE AGENT RESOURCE DEFINITION COMPOSES.
+#
+# These duplicate two values from gitops/charts/agentgateway-config deliberately. That chart renders
+# one backend per entry in its `agents` map, which works when the platform team declares agents in
+# Terraform and cannot work when agents arrive as `Agent` resources -- a Helm chart cannot render a
+# backend for an agent that does not exist yet. So on the agent-resource path each agent composes
+# its own backend and route, and needs these two values to do it.
+model:
+  # The Bedrock model an agent asks for WHEN THERE IS NO GATEWAY (gateway.enabled: false). It is a
+  # Bedrock model id, not a gateway route name, because the agent calls bedrock-runtime itself.
+  #
+  # AN INFERENCE PROFILE ID, NOT THE BARE FOUNDATION MODEL. The `us.` prefix is required: Claude
+  # Sonnet 5.5 does not support on-demand InvokeModel/Converse against the bare id, which fails
+  # with:
+  #
+  #   ValidationException: Invocation of model ID anthropic.claude-sonnet-5-5 with
+  #   on-demand throughput isn't supported. Retry your request with the ID or ARN of an inference
+  #   profile that contains this model.
+  #
+  # So the bare id breaks the exact configuration this value exists for. Note the consequence for
+  # IAM: a cross-Region profile authorises against the profile ARN AND the foundation-model ARN in
+  # whichever Region it routes to, so an agent's `modelArns` has to list every regional ARN.
+  #
+  # Unused with the gateway on, where the route name is model.gatewayModelId below.
+  directModelId: "us.anthropic.claude-sonnet-5-5"
+
+  # The model every composed backend points at. One model for the platform, overridden per agent by
+  # the ARNs the agent's own role names: the gateway offers this, and the agent's IAM policy decides
+  # whether the call is allowed.
+  bedrockModelId: us.anthropic.claude-sonnet-5-5
+
+  # The name an agent puts in the `model` field of a request, which is NOT the same thing as
+  # bedrockModelId above and differs by path.
+  #
+  # open-source: the backend name agentgateway-config renders, "bedrock-claude-sonnet".
+  # aws-services: an id from the AgentCore connector's own catalogue, bedrock/<provider>.<model>.
+  #   There is no default that works, so the chart requires it on that path rather than rendering
+  #   an agent that authenticates correctly and then 404s. Read the catalogue with
+  #   GET <gateway>/inference/v1/models and pick one that serves the OpenAI dialect.
+  gatewayModelId: ""
+
+  # When true, each agent gets its own backend assuming that agent's own role, so CloudTrail shows
+  # which agent made each model call. Set false to share one backend on the gateway's own role and
+  # lose that attribution -- in which case agentgateway-config renders the shared backend and the
+  # agent resource definition composes none.
+  perAgentRoleAssumption: true
+
+  # Session tags on that assumed role, which are the half of attribution that reaches the bill.
+  # sessionName gets the agent into CloudTrail; the Cost and Usage Report splits spend on activated
+  # cost allocation tags instead, so without these a model call's dollars have no join key back to
+  # the agent that spent them.
+  #
+  # Already satisfied here: the composed role's trust policy renders sts:TagSession alongside
+  # sts:AssumeRole, which these tags require.
+  #
+  # NOT satisfied here, and not automatable: the keys have to be activated as cost allocation tags
+  # in the Billing console of the payer account. Until then every session carries them and no report
+  # shows them. The next_steps Terraform output names it.
+  sessionTags:
+    enabled: true
+
+    # The key carrying the agent's name. Configurable because activation is account-wide, so an
+    # account already splitting cost on its own key should reuse that key.
+    agentKey: agent
+
+    # The key carrying the cluster name, so one account running several clusters separates them.
+    clusterKey: cluster
+
+    # Additional static key/value pairs, merged after the two above. STS caps a session at 50 tags.
+    extra: {}
+
+  # Models the gateway may fail over to, in priority order after bedrockModelId. Failover is one of
+  # the things that needs the request in view and is therefore the gateway's to do: an agent cannot
+  # retry against a model its own role does not name, and the credential for both is held one hop
+  # away from it.
+  #
+  # Non-empty changes the composed backend's shape from `ai.provider` to `ai.groups` -- the CRD makes
+  # them mutually exclusive -- and composes two more objects per agent, because priority order alone
+  # never fails over. At most 7, since the CRD caps groups at 8 and the primary takes one.
+  fallbackModelIds: []
+
+  failover:
+    # Evict on provider 5xx and provider throttling. 429 is the case this exists for: Bedrock quotas
+    # are per model, so a throttled primary can fail over to another model. The gateway's own
+    # token-budget 429 is a local decision
+    # rather than a backend response, so it never evicts anything.
+    unhealthyCondition: "response.code >= 500 || response.code == 429"
+
+    # Base eviction window, growing multiplicatively on repeated evictions.
+    evictionDuration: 30s
+
+    # Evict on the first unhealthy response so a throttled primary fails over immediately. Raise it
+    # to tolerate blips, at the cost of a slower failover and a visible first error.
+    evictionConsecutiveFailures: 1
+
+    # Retries happen inside the same client call, which is what hides the failover from the agent.
+    # Small on purpose: a retry buffers the request body, which for a chat completion is the prompt.
+    retryAttempts: 2
+    retryBackoff: 1s
+    retryCodes: [429, 500, 502, 503, 504]
+
+# Agent evaluation (gitops/charts/agent-evals). Rendered by Terraform from enable_evaluations; read
+# here for the two things the base chart owns: the runner's namespace, and the ingress rule on each
+# Agent's composed network policy that admits it to the agent's port for the experiment. The agent
+# still verifies the runner's token, which names that agent's own audience.
+evals:
+  enabled: false
+
+
+# The public OCI Helm registries Argo CD needs a repository Secret for, one per component that pulls
+# a chart from one. Written by Terraform on the open source path; all off in the base.
+ociRepositories:
+  agentgateway: false   # cr.agentgateway.dev/charts          29-agentgateway-crds, 30-agentgateway
+  clickhouse: false     # ghcr.io/clickhouse                  51-langfuse (the ClickHouse operator)
+  bitnamicharts: false  # registry-1.docker.io/bitnamicharts  60-memory (Valkey)

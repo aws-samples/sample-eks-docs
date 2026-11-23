@@ -1,0 +1,18 @@
+# The open source path's namespace for MCP servers the in-cluster gateway aggregates. Apply it before
+# mcp-server.yaml, on both paths. Render it with scripts/render-example.sh: the mesh label is the
+# open source path's, where AgentGateway reaches the server over the mesh.
+#
+# Not an agent namespace, deliberately: see the header of mcp-server.yaml. The ambient enrolment label
+# is inert on a cluster with no mesh, and with mesh_mode = "ambient" it is what lets ztunnel capture
+# the server and evaluate mesh-authz.yaml's AuthorizationPolicy.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-servers
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+    istio.io/dataplane-mode: ambient   # mcp-gateway: the gateway reaches the server over the mesh

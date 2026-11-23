@@ -1,0 +1,125 @@
+{{- if and (.Values.nodeClass | default dict).enabled (.Values.nodeClass | default dict).roleName }}
+{{/*
+THE AGENTS' NODES, IN STRICT NETWORK POLICY ENFORCEMENT MODE.
+
+This is the one control in this chart that cannot be applied to a running cluster and take effect.
+`networkPolicy` selects the node agent's enforcement mode -- `DefaultAllow` maps to `standard`,
+`DefaultDeny` to `strict` -- and the mode is read WHEN THE NODE BOOTS. Patching a NodeClass over
+running nodes changes nothing while the cluster reads as hardened, so the agents' nodes have to be
+launched from a NodeClass that already says `DefaultDeny`. That is why this is a NodeClass in the
+chart rather than a sentence in a runbook.
+
+What it buys: in standard mode (DefaultAllow, the cluster default) a new pod's traffic is not
+enforced until its policies are programmed, so a pod can reach a destination no policy permits in
+the moments after it starts. Strict mode (DefaultDeny) denies that traffic from the start, including
+for the first pods on a node that was launched for them.
+
+A DEDICATED NodeClass, not an edit to the cluster's `default`. On a DefaultDeny node a pod that no
+policy selects loses DNS as well as egress, so applying this to the default NodeClass breaks every
+workload on a shared cluster that is not an agent.
+
+THE INSTANCE-SIZE REQUIREMENT IS NOT COSMETIC. Nitro sandbox capability tracks instance size:
+`c6a.large` comes up with `eks.amazonaws.com/nitro-sandbox: false` and `c6a.xlarge` with `true`. A
+pool free to pick the smallest shapes provisions nodes that cannot run a sandboxed pod at all, and
+the symptom is a Pending pod with a node-affinity message rather than anything about sandboxing.
+*/}}
+apiVersion: eks.amazonaws.com/v1
+kind: NodeClass
+metadata:
+  name: {{ (.Values.nodeClass | default dict).name }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  role: {{ (.Values.nodeClass | default dict).roleName }}
+
+  subnetSelectorTerms:
+    {{- range (.Values.nodeClass | default dict).subnetIds }}
+    - id: {{ . }}
+    {{- end }}
+
+  securityGroupSelectorTerms:
+    {{- range (.Values.nodeClass | default dict).securityGroupIds }}
+    - id: {{ . }}
+    {{- end }}
+
+  # The whole point of this object.
+  # STRICT ONLY WITH THE POLICIES. With networkPolicy.enabled false no policy selects an agent, and
+  # on a DefaultDeny node a pod no policy selects is refused everything, and a turn times out
+  # connecting to the agent's Service. Without the policies there is nothing for strict mode to
+  # protect.
+  networkPolicy: {{ ternary (.Values.nodeClass | default dict).networkPolicy "DefaultAllow" (.Values.networkPolicy | default dict).enabled }}
+
+  # Writes a decision log for every allowed and denied flow, on the node. Enabled because a boundary
+  # whose refusals are invisible cannot be debugged, and the alternative is inferring a drop from a
+  # client-side timeout.
+  networkPolicyEventLogs: {{ (.Values.nodeClass | default dict).networkPolicyEventLogs }}
+
+  {{- with (.Values.nodeClass | default dict).ephemeralStorage }}
+  ephemeralStorage:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  snatPolicy: {{ (.Values.nodeClass | default dict).snatPolicy }}
+---
+{{/*
+The pool that uses it. Tainted, so nothing lands here by accident: a workload that is not an agent
+has no reason to be on a node where an unselected pod loses DNS. The agent resource definition
+tolerates the taint and selects this pool, so an `Agent` needs to know none of this.
+*/}}
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: {{ (.Values.nodeClass | default dict).name }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  template:
+    metadata:
+      labels:
+        eks-agents-ai-docs: "true"
+    spec:
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: {{ (.Values.nodeClass | default dict).name }}
+
+      taints:
+        - key: {{ (.Values.nodeClass | default dict).taintKey }}
+          value: "true"
+          effect: NoSchedule
+
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: {{ toYaml (.Values.nodeClass | default dict).capacityTypes | nindent 12 }}
+        - key: eks.amazonaws.com/instance-category
+          operator: In
+          values: {{ toYaml (.Values.nodeClass | default dict).instanceCategories | nindent 12 }}
+        - key: eks.amazonaws.com/instance-generation
+          operator: Gt
+          values: ["4"]
+        # More than 2 vCPU, or the node cannot host a sandboxed pod. See the banner above.
+        - key: eks.amazonaws.com/instance-cpu
+          operator: Gt
+          values: ["2"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+
+      expireAfter: {{ (.Values.nodeClass | default dict).expireAfter }}
+      terminationGracePeriod: {{ (.Values.nodeClass | default dict).terminationGracePeriod }}
+
+  {{- with (.Values.nodeClass | default dict).limits }}
+  limits:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+
+  disruption:
+    consolidationPolicy: {{ (.Values.nodeClass | default dict).consolidationPolicy }}
+    consolidateAfter: {{ (.Values.nodeClass | default dict).consolidateAfter }}
+{{- end }}

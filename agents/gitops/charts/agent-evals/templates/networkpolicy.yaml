@@ -1,0 +1,66 @@
+{{- if .Values.evals.enabled }}
+{{- $v := .Values }}
+# What the runner may reach. Default deny in both directions, then exactly:
+#
+#   DNS
+#   the gateway       the judge's model calls (open source: the gateway namespace; AWS: 443, below)
+#   Langfuse          reading traces and writing scores (open source)
+#   each agent        the experiment's turns, on that agent's port
+#   AWS APIs, 443     CloudWatch Logs and the AgentCore Gateway (AWS), plus the Pod Identity agent
+#
+# The agent side has to admit this namespace too: the Agent resource definition adds an ingress
+# rule for it when evals.enabled is set (gitops/base/templates/40-agent-rgd.yaml).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-evals
+  namespace: {{ $v.evals.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: agent-evals
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    # DNS, to the resolver ranges only (networkPolicy.dnsDestinations), as the agents' DNS rule does.
+    - to:
+        {{- range $v.networkPolicy.dnsDestinations }}
+        - ipBlock: { cidr: {{ . | quote }} }
+        {{- end }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    {{- if eq $v.evals.backend "langfuse" }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ ($v.gateway | default dict).namespace | default "agentgateway-system" }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: langfuse
+      ports:
+        - { protocol: TCP, port: 3000 }
+    {{- else }}
+    - to:
+        - ipBlock: { cidr: 169.254.170.23/32 }
+      ports:
+        - { protocol: TCP, port: 80 }
+    - ports:
+        - { protocol: TCP, port: 443 }
+    {{- end }}
+    {{- range $name, $a := $v.experiment.agents }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $a.namespace | default "agents" }}
+          podSelector:
+            matchLabels:
+              eks-agents/agent: {{ $name }}
+      ports:
+        - { protocol: TCP, port: {{ $a.port | default 8080 }} }
+    {{- end }}
+{{- end }}

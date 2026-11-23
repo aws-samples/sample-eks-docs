@@ -1,0 +1,59 @@
+{{- if .Values.evals.enabled }}
+{{- $v := .Values }}
+{{- if and (eq $v.evals.backend "langfuse") $v.online.enabled }}
+---
+# Online grading: a sample of the sessions that went quiet in the last window.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: agent-evals-online
+  namespace: {{ $v.evals.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app.kubernetes.io/name: agent-evals
+spec:
+  schedule: {{ $v.online.schedule | quote }}
+  # Two overlapping runs would grade the same window twice, at twice the judge spend.
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # No retry. A failed run's window is not re-graded by the next run either, and a retry would
+      # re-post the scores it did write before failing.
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        {{- include "agent-evals.pod" (dict "root" . "mode" "online") | nindent 8 }}
+{{- end }}
+{{- if $v.experiment.agents }}
+---
+# The release gate, run on demand:
+#
+#   kubectl -n {{ $v.evals.namespace }} create job --from=cronjob/agent-evals-experiment gate-$(date +%s)
+#
+# Suspended, so it never runs on a schedule. A CronJob rather than a Job so the pod spec lives in
+# Git and a run is a copy of it, with nothing hand-assembled.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: agent-evals-experiment
+  namespace: {{ $v.evals.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app.kubernetes.io/name: agent-evals
+spec:
+  schedule: "0 0 31 2 *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      # No retry. A gate that is re-run until it passes is not a gate.
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        {{- include "agent-evals.pod" (dict "root" . "mode" "experiment") | nindent 8 }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,156 @@
+# The execution tier: where model-generated code runs, with no network device at all.
+#
+# A plain Deployment rather than an Agent resource. The Agent resource composes an IAM role, a Pod
+# Identity association and an egress policy, and this tier wants none of the three: it has no AWS
+# identity because it cannot reach AWS, and no egress rules because it has no interface for a rule
+# to apply to.
+#
+# Using the Agent resource here would create a role nothing can use and an egress policy with
+# nothing to govern, which reads as an oversight to the next person. The absence is the architecture.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: execution
+  namespace: agents-execution
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/tier: execution
+
+# No Kubernetes API credential. This pod runs whatever the model decided to run and has no reason to
+# hold a token for the cluster it runs on.
+#
+# Set here rather than in the pod spec so it covers every pod using this service account, including
+# ones added later. Sandboxed pods get it twice over: isolated mode does not replicate the service
+# account token into the sandbox at all. And with no Pod Identity association, a command finds no
+# AWS role and no model credential either.
+automountServiceAccountToken: false
+---
+# The shared workspace: the only channel between the two tiers.
+#
+# ReadWriteMany, because the reasoning tier stages files in and reads results out while the
+# execution pod holds it. On EKS Auto Mode that means EFS — which this tier cannot mount, because EFS
+# needs the network this tier does not have.
+#
+# So the handoff is the other way round: the reasoning tier writes to S3 and the execution tier reads
+# from a volume the node-side CSI driver populated, or the reasoning tier uses `kubectl cp` over the
+# sandbox's control channel. EBS works here (ReadWriteOncePod, attached from outside the guest);
+# this example takes the simplest form, an emptyDir per pod, and stages over the control channel.
+#
+# A team wiring the volume handoff properly should read the storage examples in
+# aws-samples/sample-eks-nitro-sandbox: which volume types survive network isolation is documented
+# there rather than inferred.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: execution
+  namespace: agents-execution
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/tier: execution
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      eks-agents/tier: execution
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: eks-agents-paved-paths
+        eks-agents-ai-docs: "true"
+        eks-agents/tier: execution
+
+      annotations:
+        # THE LINE THAT MATTERS.
+        #
+        # Boots the guest with no network interface besides loopback: no route out, no DNS, no
+        # instance metadata and no Pod Identity credentials. Because the device is absent rather
+        # than filtered, there is no rule for the agent to find its way around and no policy for an
+        # operator to get wrong.
+        #
+        # kubectl exec, cp and logs keep working, because they ride the sandbox's internal control
+        # channel rather than a network device. That is the reasoning tier's only way in.
+        sandbox.amazonaws.com/network-isolated: "true"
+
+    spec:
+      serviceAccountName: execution
+
+      # The one line that puts the pod in a Nitro sandbox. No node selector, toleration or sidecar:
+      # the RuntimeClass carries the scheduling constraints and EKS Auto Mode brings up a
+      # sandbox-capable node.
+      runtimeClassName: isolated-sandbox
+      # ON THE AGENTS' OWN POOL, like every Agent (gitops/base/templates/_agent-pod.tpl), so the pod
+      # runs on a node in strict network policy mode rather than on a general-purpose node in
+      # standard mode.
+      nodeSelector:
+        karpenter.sh/nodepool: eks-agents
+      tolerations:
+        - {key: eks-agents/dedicated, operator: Equal, value: "true", effect: NoSchedule}
+
+      # No <SERVICE>_HOST or <SERVICE>_PORT variables for the other Services in this namespace, so
+      # a command the model runs finds nothing in its environment that names one. The KUBERNETES_*
+      # variables are injected whatever this says; they name an address this pod has no route to and
+      # no token for.
+      enableServiceLinks: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: execution
+          # A plain language runtime. What runs inside it is whatever the reasoning tier sends, so
+          # this image should carry the interpreter and the tools and nothing else — no cloud SDK,
+          # no credentials helper, nothing that would be useful to code trying to reach AWS.
+          image: public.ecr.aws/docker/library/python:3.13-slim
+          imagePullPolicy: IfNotPresent
+
+          command: ["sh", "-c"]
+          args:
+            - |
+              # Print what the tier can see, once, so `kubectl logs` is the evidence that the
+              # isolation took effect rather than something to infer from a pod being Ready.
+              echo "execution tier ready"
+              echo "kernel:  $(uname -rv)"
+              echo "machine: $(cat /sys/class/dmi/id/product_name 2>/dev/null || echo unknown)"
+              echo "routes:  $(awk 'NR>1 && $2=="00000000" {print "default dev " $1}' /proc/net/route | grep . || echo none)"
+              exec sleep infinity
+
+          workingDir: /workspace
+
+          resources:
+            requests:
+              # The sandbox is sized from these. A pod with no requests gets a small default guest,
+              # which is usually too small for a build or a test run.
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # Not readOnlyRootFilesystem. This tier exists to run code that writes files, and
+            # /workspace alone is not enough for a package install or a compiler's temporary output.
+            # The containment here is the absent network and the sandbox kernel, not the filesystem.
+            readOnlyRootFilesystem: false
+
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+            - { name: tmp, mountPath: /tmp }
+
+      volumes:
+        - name: workspace
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

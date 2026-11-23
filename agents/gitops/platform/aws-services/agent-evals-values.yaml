@@ -1,0 +1,26 @@
+# The evaluation runner's settings that belong to this platform rather than to the chart:
+# the release gate's cases and the runner image. Read by 52-agent-evals.yaml after
+# terraform-values.yaml, so anything here overrides both the chart's defaults and Terraform's.
+#
+# Edited by hand and reviewed like any other change -- the cases ARE the release criteria.
+
+# The runner image tag in the agents/evals repository Terraform creates. Tags there are immutable,
+# so a rebuilt image is a new tag here.
+image:
+  tag: v1
+
+# The release gate. Each agent needs `expose: cluster` (a Service) and runs every case as a real
+# turn; a case with expectedOutput is also graded for correctness. Empty renders no gate.
+#
+# Run it:  kubectl -n agent-evals create job --from=cronjob/agent-evals-experiment gate-$(date +%s)
+#          (or: ./scripts/exercise.sh --path aws-services evals)
+experiment:
+  minPassRate: 0.8
+  agents: {}
+    # research:
+    #   namespace: agents
+    #   port: 8080
+    #   cases:
+    #     - name: capital-france
+    #       input: What is the capital of France?
+    #       expectedOutput: Paris

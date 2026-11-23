@@ -1,0 +1,247 @@
+{{- if eq .Values.region "REGION_NOT_SET" }}
+{{ fail "region is still the placeholder. The Bedrock backend names the Region, so a placeholder here produces a gateway that cannot reach a model. Pass the terraform-values.yaml file your path's Terraform wrote as a second values file on the Argo CD Application." }}
+{{- end }}
+{{- if not .Values.oidcIssuerUrl }}
+{{ fail "oidcIssuerUrl is required. It is what the gateway validates an agent's service account token against, and it is the whole of how the gateway knows which agent is calling. Without it the gateway would accept any token, which would make per-agent routing, policy and budgets decorative." }}
+{{- end }}
+{{/*
+The egress point: one GatewayClass, one Gateway, one listener.
+
+This is the single destination the cluster-scoped network policy permits. Everything an agent reaches
+outside the cluster arrives here, which is what replaces the list of approved destinations a
+base-layer stack would have to maintain.
+
+SCHEMA NOTE. The shapes in this chart follow the AgentgatewayPolicy CRD as shipped in v1.7.0. Several
+differ from what a naive reading of the API suggests, and each of those readings is rejected at
+apply:
+
+  - `authorization` carries `action` as a SIBLING of `policy`, not inside it.
+  - A JWT provider takes `jwks.remote.url`, not `jwksUri`.
+  - Token budgets are `traffic.rateLimit`, not `backend.ai.rateLimit`.
+  - `frontend.connect.mode` is Deny | Route | Tunnel. There is no Terminate.
+  - Prompt guarding is `backend.ai.promptGuard.request[]` with typed processors, and
+    `bedrockGuardrails` is one of them rather than something to wire by hand.
+
+Re-check on a version bump with:
+  kubectl explain agentgatewaypolicy.spec --recursive
+*/}}
+{{- if .Values.gateway.createGatewayClass }}
+---
+{{/*
+OFF BY DEFAULT, BECAUSE THE CONTROLLER REGISTERS THIS ITSELF.
+
+The agentgateway controller creates the `agentgateway` GatewayClass on startup. It is not part of the
+agentgateway Helm chart -- `helm get manifest agentgateway` renders zero GatewayClass objects -- so it
+belongs to no release and carries no Helm ownership metadata. Rendering it here as well is a
+collision, and what happens next depends on who applies it:
+
+  Helm        refuses the whole release:
+              GatewayClass "agentgateway" exists and cannot be imported into the current release:
+              invalid ownership metadata; label validation error: missing key
+              "app.kubernetes.io/managed-by"
+  Argo CD     takes shared ownership through ServerSideApply, which works and leaves two things
+              believing they own one object
+
+Installing this chart with Helm after the agentgateway chart, with the base chart already applied,
+fails on exactly that error.
+
+Set this true only on a cluster where the controller does NOT pre-register the class -- a
+GatewayClass this stack must create for a different controller, or a controller build that stopped
+registering its own.
+*/}}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: agentgateway
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  controllerName: agentgateway.dev/agentgateway
+{{- end }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ $.Values.gateway.name }}
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  gatewayClassName: agentgateway
+
+  {{- if .Values.capture.enabled }}
+  # Names the AgentgatewayParameters that 05-capture.yaml renders, which is what puts the three
+  # labels on the provisioned pods -- the app label the ServiceEntry selects, dataplane-mode none so
+  # the gateway is not captured by its own catch-all, and the tunnel label that tells ztunnel these
+  # pods terminate HBONE.
+  infrastructure:
+    parametersRef:
+      group: agentgateway.dev
+      kind: AgentgatewayParameters
+      name: {{ .Values.gateway.name }}
+  {{- end }}
+
+  listeners:
+    - name: {{ $.Values.gateway.name }}
+      port: {{ .Values.gateway.port }}
+      protocol: HTTP
+
+      allowedRoutes:
+        namespaces:
+          # Same namespace only. Routes are the gateway's own configuration, and allowing any
+          # namespace to attach a route to the egress point would let a tenant add a destination to
+          # the one object that is supposed to be the complete list of them.
+          from: Same
+    {{- if .Values.capture.enabled }}
+
+    # Where ztunnel delivers a captured connection. The tunnel carries the caller's mesh identity,
+    # which is what the gateway reads to decide which agent is calling; the inner request is then
+    # dispatched to the HTTP listener above, where the routes attach. Two listeners, one data plane.
+    #
+    # 15008 is the mesh's own HBONE port, not the application's. The agent still speaks plain HTTP
+    # on the captured port.
+    - name: hbone
+      port: 15008
+      protocol: HBONE
+      allowedRoutes:
+        namespaces:
+          from: Same
+    {{- end }}
+---
+{{/*
+Inbound authentication and authorization on the Gateway.
+
+Two things happen here. jwtAuthentication is how the gateway learns which agent is calling: the agent
+presents its own service account token and the gateway validates it against the cluster's OIDC
+issuer. authorization then decides whether that agent may use the gateway at all.
+
+Note what the gateway does with an identity the agent asserted for itself: it overwrites it. The
+caller's verified identity is the one from the validated token, so an agent cannot route itself to
+another agent's backend by claiming to be it.
+*/}}
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: agent-inbound-auth
+  namespace: {{ .Values.gateway.namespace }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: {{ $.Values.gateway.name }}
+
+  traffic:
+    {{- if (((.Values.personAccess | default dict).viaGateway | default dict).enabled) }}
+    # PRE-ROUTING, so the agent is verified and bound to its path BEFORE route policies run. The
+    # person-data routes (15-person-aws.yaml) verify a SECOND token, the person's, with a route-level
+    # jwtAuthentication; in the default PostRouting phase that route policy would replace this one
+    # (the more specific target wins), and the agent's token would go unchecked on those routes.
+    phase: PreRouting
+    {{- end }}
+    jwtAuthentication:
+      # Strict, not Optional or Permissive. Optional would let an unauthenticated caller through to
+      # the authorization rule with no claims to match on, and Permissive admits a token that fails
+      # validation. On an egress gateway whose whole job is per-agent attribution, a request with no
+      # verified identity has nothing to attribute.
+      mode: Strict
+
+      providers:
+        - issuer: {{ .Values.oidcIssuerUrl | quote }}
+
+          # The audience the agent's projected token is minted for. Scoped, so a token the agent
+          # obtained for some other relying party is not accepted here. A workload can request its
+          # identity as a JWT naming any audience and there is no allowlist at fetch time, so this
+          # check and the subject check below are the whole of the separation.
+          audiences:
+            - {{ .Values.gateway.audience | quote }}
+
+          jwks:
+            remote:
+              # {issuer}/keys, which is what the cluster's own OIDC discovery document advertises as
+              # jwks_uri and is reachable unauthenticated. NOT {issuer}/openid/v1/jwks -- that is
+              # the in-cluster API server's path, and against the public EKS OIDC endpoint it
+              # returns 403. The symptom is the gateway retrying "error fetching jwks" every 15
+              # seconds while every agent request is rejected for an unverifiable token.
+              #
+              # Confirm for your cluster rather than assuming:
+              #   curl -s $ISSUER/.well-known/openid-configuration | jq -r .jwks_uri
+              url: {{ printf "%s/keys" .Values.oidcIssuerUrl | quote }}
+              cacheDuration: 10m
+
+    authorization:
+      # action is a sibling of policy, not a field inside it.
+      action: Allow
+      policy:
+        matchExpressions:
+          {{/*
+          THE SUBJECT HAS TO BE CORRELATED WITH THE PATH, and this is the only place that can do it.
+
+          The model route is per agent and the backend behind it assumes THAT agent's IAM role, so
+          the requested path decides which role the gateway signs as. A rule that only checks
+          membership -- "is this a declared agent" -- admits an agent to every other agent's route:
+          it is authenticated, routed, and served with somebody else's credential, which CloudTrail
+          then attributes to that other agent and Bedrock scopes by that agent's model ARNs.
+
+          Without the expression below, one agent's own projected token POSTed to another agent's
+          /llm/<name>/chat/completions route is served. With it, that call gets 403, and the agent's
+          own route still works.
+
+          A PER-ROUTE ALLOW POLICY DOES NOT FIX THIS, which is the trap worth remembering. Adding a
+          narrower Allow targeting each HTTPRoute looks like the obvious fix and changes nothing:
+          authorization policies UNION, so a request allowed by the Gateway-wide rule is allowed
+          whatever a route-level rule says, while the route policies report Accepted=True and
+          Attached=True. This is the same shape as the Istio ALLOW-policy trap described in
+          gitops/base/templates/50-mesh-authz.yaml: a second ALLOW never narrows the first. Narrowing
+          has to happen in the rule that already admits.
+
+          The ternary is what keeps /mcp working: only model routes carry an agent name in the path,
+          so every other route falls back to the membership check, and the MCP surface behaves
+          identically with and without it.
+          */}}
+          {{- $judge := "" }}
+          {{- if (.Values.evals | default dict).enabled }}
+          {{- /*
+          THE JUDGE'S BRANCH, first, so a /judge/ path is decided on the judge's subject alone and
+          never falls through to the agents' membership check -- and the judge's subject, being in
+          another namespace, is refused on /llm/ and /mcp by the branches that follow.
+          */}}
+          {{- $judge = printf "request.path.startsWith(\"/judge/\") ? jwt.sub == \"system:serviceaccount:%s:\" + request.path.split(\"/\")[2] : " .Values.evals.namespace }}
+          {{- end }}
+          {{- /*
+          A THIRD-PARTY DESTINATION IS DECIDED ON ITS OWN CALLERS, ahead of everything else, for the
+          same reason the model route is: the route behind that host attaches a credential (a GitHub
+          token, say), so "is this an agent" would hand that credential to every agent. Each
+          destination's branch admits only the agents its `callers` names, and a request for its host
+          never reaches the membership check below. A destination with no callers is refused for
+          everyone rather than opened to all: a credential with nobody named to use it is a
+          misconfiguration, not a default.
+          */}}
+          {{- range $name, $dest := (.Values.destinations | default dict) }}
+          {{- $subs := list }}
+          {{- range ($dest.callers | default list) }}
+          {{- $subs = append $subs (printf "\"system:serviceaccount:%s:%s\"" $.Values.namespaces.reasoning .) }}
+          {{- end }}
+          {{- $judge = printf "%srequest.host == %q ? jwt.sub in [%s] : " $judge $dest.host (join ", " $subs) }}
+          {{- end }}
+          {{- if (((.Values.personAccess | default dict).viaGateway | default dict).enabled) }}
+          {{- /*
+          A PERSON-DATA ROUTE IS DECIDED ON THE AGENT IN ITS PATH, like the model route: /aws/<agent>/
+          signs with that agent's person role, so only that agent may use it.
+          */}}
+          {{- $judge = printf "%srequest.path.startsWith(\"/aws/\") ? jwt.sub == \"system:serviceaccount:%s:\" + request.path.split(\"/\")[2] : " $judge .Values.namespaces.reasoning }}
+          {{- end }}
+          {{- if .Values.agents }}
+          - >-
+            {{ $judge }}request.path.startsWith("/llm/") ? jwt.sub == "system:serviceaccount:{{ $.Values.namespaces.reasoning }}:" + request.path.split("/")[2] : jwt.sub in [{{ range $i, $name := (keys .Values.agents | sortAlpha) }}{{ if $i }}, {{ end }}"system:serviceaccount:{{ $.Values.namespaces.reasoning }}:{{ $name }}"{{ end }}]
+          {{- else }}
+          # No agents declared, which is the case when the agent resource definition composes them.
+          # The non-model branch restricts to the reasoning namespace rather than allowing
+          # everything, so a chart rendered before any agent exists fails closed.
+          - >-
+            {{ $judge }}request.path.startsWith("/llm/") ? jwt.sub == "system:serviceaccount:{{ .Values.namespaces.reasoning }}:" + request.path.split("/")[2] : jwt.sub.startsWith("system:serviceaccount:{{ .Values.namespaces.reasoning }}:")
+          {{- end }}

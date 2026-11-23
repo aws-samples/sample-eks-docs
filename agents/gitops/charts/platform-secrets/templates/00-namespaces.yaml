@@ -1,0 +1,47 @@
+{{- if and .Values.platformSecrets.enabled .Values.platformSecrets.createNamespaces }}
+{{- range $ns := .Values.platformSecrets.namespaces }}
+{{- if not (has $ns ($.Values.platformSecrets.externallyOwnedNamespaces | default list)) }}
+{{- $needed := false }}
+{{- range $name, $spec := $.Values.platformSecrets.secrets }}
+{{- if and $spec.secretsManagerName (eq $spec.namespace $ns) }}
+{{- $needed = true }}
+{{- end }}
+{{- end }}
+{{- if $needed }}
+---
+{{/*
+THE NAMESPACE, CREATED HERE BECAUSE THIS CHART IS THE FIRST THING IN IT.
+
+The components that own these namespaces -- Prometheus in `monitoring`, valkey in `agent-memory`,
+Langfuse in `langfuse` -- are Applications at sync waves 0, 1 and 2, and each creates its namespace
+with `CreateNamespace=true`. This chart has to land BEFORE them, because its whole job is to have
+the Secret in place by the time a consumer pod starts. So it cannot wait for their namespaces.
+
+ORDER MATTERS, AND ONLY ONE DIRECTION WORKS. On a fresh cluster this chart runs first, creates the
+namespaces with Helm's ownership metadata, and every later `CreateNamespace=true` or
+`--create-namespace` is a no-op. The reverse fails: a namespace created by ANOTHER release's
+`--create-namespace` carries no ownership metadata, and this chart then cannot adopt it --
+
+  Namespace "agent-memory" ... exists and cannot be imported into the current release: invalid
+  ownership metadata; label validation error: missing key "app.kubernetes.io/managed-by"
+
+which is what happens if the memory or observability Applications install ahead of this one.
+
+To recover on a cluster where that happened, hand this chart the namespaces rather than deleting
+anything:
+
+  kubectl label ns <ns> app.kubernetes.io/managed-by=Helm --overwrite
+  kubectl annotate ns <ns> meta.helm.sh/release-name=platform-secrets \
+    meta.helm.sh/release-namespace=kube-system --overwrite
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+{{- end }}{{/* $needed */}}
+{{- end }}{{/* not externally owned */}}
+{{- end }}{{/* range */}}
+{{- end }}

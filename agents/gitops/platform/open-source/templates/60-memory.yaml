@@ -1,0 +1,178 @@
+{{- if not (has "60-memory.yaml" .Values.excluded) }}
+# Memory on the open source path, as three rungs a platform team climbs only as far as its use case
+# reaches.
+#
+#   session state      Redis (Valkey)   an agent holds state between turns
+#   semantic recall    pgvector         an agent retrieves by meaning
+#   consolidation      Mem0             an agent personalizes across sessions
+#
+# Most agents need the first rung and nothing else. A coding or build agent needs none of them: its
+# state is ephemeral, and the execution tier reaches a volume and a bucket rather than a store. An
+# agent answering questions over a corpus usually stops at semantic recall, because what it needs is
+# retrieval rather than memory. Consolidation is the rung most teams do not reach, and a team that
+# cannot name its case for it is better off without it.
+#
+# Each rung below is a separate Application so leaving one out is a file you did not add rather than
+# a value you have to find. Rung 1 is on; rungs 2 and 3 are not.
+#
+# These templates implement the ladder above and nothing else. The agents-memory page of the EKS
+# User Guide says what a team already running another vector store does instead.
+---
+# Rung 1: session and working state. A key-value store is the whole answer for the state an agent
+# holds between the turns of one task.
+#
+# This is also what removes the need for MCP session affinity. An agent holding no session in the pod
+# can be load balanced freely and needs no stickiness. The agents-ingress page of the EKS User Guide covers it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agent-session-state
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/memory-rung: session-state
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  # ---------------------------------------------------------------------
+  # CHECK THE IMAGE SOURCE BEFORE SYNCING THIS
+  # ---------------------------------------------------------------------
+  #
+  # Bitnami changed its distribution model in 2025: the public catalogue now carries only the latest
+  # tag of each image, and the versioned tags a pinned chart references moved to the bitnamilegacy
+  # repository or behind Bitnami Secure Images. So a pinned chart version here can resolve to an
+  # image tag that is not published any more, and the symptom is ImagePullBackOff on a chart that
+  # rendered cleanly.
+  #
+  # Check it before syncing, and decide deliberately:
+  #
+  #   helm template valkey oci://registry-1.docker.io/bitnamicharts/valkey --version 6.3.13 | grep 'image:'
+  #   crane manifest <that image> >/dev/null && echo pullable
+  #
+  # Three ways out, in the order most teams should consider them:
+  #   1. Use the ElastiCache Serverless cache from terraform/modules/memory-aws even on this path.
+  #      Session state is the one rung almost every agent needs, and a managed cache is the least
+  #      interesting thing for a platform team to operate. Mixing is expected: the two paths are not
+  #      mutually exclusive.
+  #   2. Mirror the image into the ECR repositories the cluster module already creates, and set
+  #      image.registry and image.repository here.
+  #   3. Run the Valkey operator instead of this chart.
+  source:
+    # OCI, NOT THE HTTPS INDEX: the https index does not serve this version.
+    #
+    # Bitnami's catalogue moved to an OCI registry. The https index still LISTS 6.3.13 --
+    # `helm search repo bitnami/valkey --versions` shows it -- so the pin looks fine and resolves to
+    # nothing pullable:
+    #
+    #   Error: invalid_reference: invalid tag
+    #
+    # from both `helm show chart` and `helm install`, while the
+    # same version pulls cleanly from the OCI coordinates below. An index that lists a chart is not
+    # an index that serves it.
+    #
+    # Argo CD needs the repository registered with OCI enabled to use this:
+    # the base chart's 05-oci-repositories.yaml does it while enable_session_state is on.
+    repoURL: registry-1.docker.io/bitnamicharts
+    chart: valkey
+    targetRevision: 6.3.13
+
+    helm:
+      valuesObject:
+        architecture: replication
+
+        auth:
+          enabled: true
+          # Not set here. A password in a Helm values file is a password in Git. Create the secret
+          # out of band:
+          #   kubectl -n agent-memory create secret generic valkey-auth --from-literal=password=...
+          existingSecret: valkey-auth
+          existingSecretPasswordKey: password
+
+        primary:
+          persistence:
+            enabled: true
+            size: 20Gi
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 4Gi
+
+          # Session state is working state: reconstructible from the durable checkpoint in S3. The
+          # eviction policy follows from that — evicting the least recently used key is correct
+          # here, where it would be data loss on a store of record.
+          configuration: |
+            maxmemory-policy allkeys-lru
+
+        replica:
+          replicaCount: 1
+          persistence:
+            enabled: true
+            size: 20Gi
+
+        # Not an agent, not sandboxed. The sandbox protects the node from untrusted code; a cache
+        # runs no untrusted code.
+        networkPolicy:
+          enabled: true
+
+          # `allowExternal: false` is the right posture and it is NOT self-sufficient. It makes the
+          # chart's NetworkPolicy admit only two sources: valkey's own pods, and pods carrying
+          # `agent-session-state-valkey-client: "true"`. Nothing applies that label to an agent, so
+          # on its own this setting makes the cache accept no connection from any agent.
+          #
+          # This is the FOURTH policy layer on one call to session state, after the cluster policy,
+          # the namespaced policy and the per-agent policy composed by the agent resource
+          # definition -- and it is the only one on the DESTINATION side, so no amount of reading
+          # the agent's egress rules reveals it. Every layer fails the same way: a socket timeout to
+          # a name that resolves.
+          allowExternal: false
+
+          # So name the callers explicitly, by namespace. A namespace selector rather than the
+          # chart's client label: the label is this chart's private convention and would have to be
+          # stamped on every agent pod by the agent resource definition, which would couple the
+          # agent template to whichever cache is installed. The namespaces that may reach session
+          # state are a property of the platform, and they belong here.
+          #
+          # Keep this in step with networkPolicy.inClusterDestinations in gitops/base/values.yaml:
+          # that list is what opens the three egress layers on the agent side, and this is the
+          # ingress grant on the other end of the same connection.
+          extraIngress:
+            - from:
+                - namespaceSelector:
+                    matchLabels:
+                      kubernetes.io/metadata.name: agents
+              ports:
+                - { protocol: TCP, port: 6379 }
+
+  destination:
+    name: eks-agents
+    namespace: agent-memory
+
+  syncPolicy:
+    # SHORT BACKOFF, on every automated Application. A first attempt that fails because something
+    # it needs is not there yet (a CRD, a webhook, a namespace) is the normal case on a new cluster,
+    # and the retry is what converges it. With the managed Argo CD's defaults, Applications spend
+    # several minutes retrying with backoff that grows to minutes, and a chart that syncs in seconds
+    # waits behind them. Capped at 30 s, a transient failure costs seconds; the higher limit keeps the
+    # total time a real failure is retried about the same.
+    retry:
+      limit: 10
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+{{- end }}

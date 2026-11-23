@@ -1,0 +1,80 @@
+# A values file shaped like the one TERRAFORM RENDERS, not like the committed placeholder.
+#
+# WHY THIS FILE EXISTS. validate.sh renders the base chart against
+# gitops/platform/<path>/terraform-values.yaml, which is the committed placeholder. That file omits
+# whole blocks, so the chart's own defaults apply and every `.Values.x.y.z` resolves. The file an
+# apply actually writes is produced by `yamlencode` over a Terraform object, and it contains every
+# key the object has -- including the ones that are NULL because the feature is off.
+#
+# A null in a later values file does not merge with the chart's map. It REPLACES it. So the
+# validated shape and the deployed shape differ in the one way that breaks a render:
+#
+#   Error: ... at <.Values.ingress.oidc.issuer>: nil pointer evaluating interface {}.issuer
+#
+# Without this file, every check passes against the placeholder while the chart cannot render
+# against this root's own output, with ingress off -- which is the default.
+#
+# So this file carries the nulls deliberately. Every key here is one an apply can legitimately
+# render as null, and the chart has to survive all of them. Add a key when Terraform gains one that
+# can be null; that is cheaper than finding out from a cluster.
+accountId: "111122223333"
+cluster: null-shape
+region: us-west-2
+partition: aws
+path: open-source
+oidcIssuerUrl: "https://oidc.eks.us-west-2.amazonaws.com/id/EXAMPLE"
+
+# Off, and therefore null rather than absent -- the case that failed.
+ingress:
+  enabled: false
+  namespace: agents
+  certificateArn: ""
+  scheme: internal
+  domainName: ""
+  oidc: null
+  cognito: null
+  dnsReconciler: null
+  loadBalancerCidrs: []
+
+# The same shape for every other block an apply can null out.
+platformSecrets:
+  enabled: false
+  secrets: null
+
+gateway:
+  namespace: agentgateway-system
+  serviceAccount: egress
+  roleArn: ""
+  secretNames: null
+  audience: agentgateway
+  trustDomain: cluster.local
+
+mesh:
+  mode: none
+  trustDomain: cluster.local
+
+# Not nullable: the chart has a fail guard for this and the guard is correct, so the file supplies
+# a real-looking value rather than exercising the guard. This file is for NULLS, not for guards.
+memory:
+  consolidation:
+    dbSecretArn: ""
+    embeddingModelId: amazon.titan-embed-text-v2:0
+    embeddingDims: 1024
+storage:
+  checkpointBucket: "null-shape-agent-checkpoints-111122223333"
+
+capabilities:
+  ack:
+    roleName: ""
+  kro:
+    roleName: ""
+
+nodeClass: null
+
+agentResource:
+  enabled: true
+  rolePath: /eks-agents/
+  permissionsBoundaryArn: "arn:aws:iam::111122223333:policy/b"
+
+registry: null
+agents: null

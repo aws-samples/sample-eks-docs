@@ -1,0 +1,2 @@
+# Secrets Manager (read the OAuth client secret, write the consented token). Pinned; see ../../VERSIONS.md.
+boto3==1.40.70

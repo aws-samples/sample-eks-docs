@@ -1,0 +1,698 @@
+{{- if and .Values.networkPolicy.enabled .Values.networkPolicy.clusterScoped }}
+{{/*
+The egress boundary, cluster-scoped.
+
+Why cluster-scoped and not a namespaced policy in the agent's own namespace: a namespaced policy can
+be replaced by anyone holding RBAC in that namespace, and an agent platform cannot rest its egress
+guarantee on an object a tenant can edit. A ClusterNetworkPolicy in the Admin tier is evaluated
+before any namespaced policy and cannot be overridden by one.
+
+What the policies below do, in evaluation order (lowest priority number first):
+
+  priority 1   Admin tier, Accept.  The infrastructure namespaces, in both directions (see below).
+  priority 10  Admin tier, Deny.    The execution tier reaches nothing. Belt to the braces of its
+                                    pods having no network device at all.
+  priority 20  Admin tier, Accept.  DNS from the reasoning namespace.
+  priority 30  Admin tier, Accept.  The approved destinations: the gateway (or Amazon Bedrock with
+                                    no gateway), Pod Identity, and the storage, memory, telemetry
+                                    and OIDC destinations the platform's components need.
+  priority 35  Admin tier, Accept.  The Kubernetes API, for an Agent with needsClusterApi (opt-in
+                                    with adminTierDefaultDeny).
+  priority 36  Admin tier, Accept.  The MCP servers' namespace, for an Agent with mcpAudience
+                                    (opt-in with adminTierDefaultDeny).
+  priority 40  Admin tier, Deny.    Everything else from the reasoning namespace (opt-in:
+                                    networkPolicy.adminTierDefaultDeny).
+
+Admin tier Deny takes precedence over every Accept anywhere, and an Admin tier Accept ends
+evaluation. Without the priority 40 Deny, a destination these policies do not name falls through to
+the namespaced and per-agent ApplicationNetworkPolicies, which deny by default; with it, the Admin
+tier's Accepts are the reasoning namespace's whole reachable set.
+
+SCHEMA. The field names and the action enum below are the shipped ClusterNetworkPolicy CRD's, which
+differs from the upstream AdminNetworkPolicy API in two ways that matter here:
+
+  - The action enum is Accept, Deny, Pass. There is no "Allow".
+  - Egress `to` peers accept domainNames, as well as namespaces, pods and networks. So hostname
+    pinning IS available in the cluster-scoped tier and does not have to drop to a namespaced
+    ApplicationNetworkPolicy. That matters for the AWS services path, where the gateway is reached
+    over the internet by name.
+
+Re-check it if you are on a different platform version, which takes one command:
+
+  kubectl explain clusternetworkpolicy.spec.egress --recursive
+
+And confirm ENFORCEMENT separately, because that is the failure that is silent. Until the ConfigMap
+in 10-network-policy-controller.yaml exists, every policy here is accepted by the API server and
+ignored: objects appear, `kubectl get` shows them, nothing drops a packet.
+
+  kubectl -n {{ .Values.namespaces.reasoning }} run probe --rm -it --restart=Never \
+    --image=public.ecr.aws/amazonlinux/amazonlinux:2023 \
+    --overrides='{"spec":{"runtimeClassName":"isolated-sandbox"}}' \
+    --command -- curl -sS --max-time 5 https://example.com
+
+That must fail. If it succeeds, the boundary is not there.
+*/}}
+---
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ClusterNetworkPolicy
+metadata:
+  name: eks-agents-execution-tier-no-egress
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  tier: Admin
+
+  # Lowest number first, and a Deny here ends evaluation for this traffic whatever else accepts it.
+  priority: 10
+
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Values.namespaces.execution }}
+
+  egress:
+    - name: deny-all-egress
+      action: Deny
+      to:
+        - networks:
+            - 0.0.0.0/0
+
+  ingress:
+    - name: deny-all-ingress
+      action: Deny
+      from:
+        - namespaces:
+            matchLabels: {}
+---
+{{/*
+THE INFRASTRUCTURE THAT RUNS ON THE AGENTS' NODES, AND WHY IT NEEDS NAMING.
+
+templates/11-agents-nodeclass.yaml puts the agents on nodes whose NodeClass says
+`networkPolicy: DefaultDeny`, which is the node agent's STRICT mode: a pod that no policy selects is
+denied, in both directions. That is the point of it for an agent. It is fatal for everything else
+that has to run on the same node.
+
+WITHOUT THIS THE MESH STOPS ON THESE NODES. `ztunnel` is a DaemonSet, so it runs on every node
+including these, and no other policy selects it --
+
+  XDS client connection error: gRPC connection error connecting to
+  https://istiod.istio-system.svc:15012 ... source: dns error, retrying in 15s
+  Readiness probe failed: Get "http://10.0.3.164:15021/healthz/ready": context deadline exceeded
+
+-- so the per-node proxy on the agents' own node never becomes Ready, its readiness probe from the
+kubelet is dropped too, and the mesh carries nothing for exactly the pods it exists to carry.
+
+So the namespaces whose pods run on these nodes -- the node's own DaemonSets in kube-system, ztunnel
+and istio-cni, and the netpol-verdicts DaemonSet in monitoring -- are accepted at priority 1, ahead
+of every agent rule (networkPolicy.infrastructureNamespaces says which and why). This is not a
+loosening of the agent boundary: the subject is the infrastructure namespaces, never an agent
+namespace. An agent namespace appearing in this list would hand every agent unrestricted egress,
+which is why `scripts/validate.sh` refuses that overlap.
+
+Only those namespaces. A platform component that runs on general-purpose nodes is in standard mode,
+where an unselected pod keeps working, and listing its namespace here would make its own policies
+inert, because an Admin-tier Accept ends evaluation. Add a namespace when a component you deploy has
+to run on the agents' nodes. Leave an agent namespace out, always.
+*/}}
+{{- if .Values.networkPolicy.infrastructureNamespaces }}
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ClusterNetworkPolicy
+metadata:
+  name: eks-agents-infrastructure
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  tier: Admin
+  priority: 1
+
+  subject:
+    namespaces:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values:
+            {{- range .Values.networkPolicy.infrastructureNamespaces }}
+            - {{ . }}
+            {{- end }}
+
+  # Both directions. A readiness probe is ingress from the node, and a DaemonSet that cannot be
+  # probed is a DaemonSet the kubelet restarts forever.
+  ingress:
+    - action: Accept
+      name: allow-all-ingress
+      from:
+        - namespaces: {}
+  egress:
+    - action: Accept
+      name: allow-all-egress
+      to:
+        - networks:
+            - 0.0.0.0/0
+{{- end }}
+---
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ClusterNetworkPolicy
+metadata:
+  name: eks-agents-dns
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  tier: Admin
+  priority: 20
+
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Values.namespaces.reasoning }}
+
+  egress:
+    {{/*
+    Port 53 to the resolver ranges rather than to one CoreDNS Service IP, because the resolver is
+    not in the same place on every cluster. Narrowing this is the single easiest way to take all DNS
+    down.
+
+    On EKS Auto Mode, CoreDNS is managed and its pods are not selectable, so a podSelector on
+    `k8s-app=kube-dns` matches nothing. Some clusters have a `kube-dns` Service whose ClusterIP can
+    be pinned by CIDR; others have no `kube-dns` Service at all, and then neither tighter form
+    works. The symptom of getting it wrong is `[Errno -3] Temporary failure in name resolution` in
+    the agent, then connect timeouts on names already cached.
+
+    So neither pinned form is a safe default. The rule names the resolver RANGES instead
+    (networkPolicy.dnsDestinations): every resolver an EKS pod uses is inside them, and a resolver
+    on a public address is not. If you want the tighter rule, read your own cluster first:
+
+      kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}{"\n"}'
+      kubectl -n kube-system get pods -l k8s-app=kube-dns
+
+    and if the Service is absent, take the nameserver a running pod actually uses -- which is the
+    only authority here -- from `cat /etc/resolv.conf` inside it. EKS uses the 10.100.0.0/16
+    service CIDR by default and 172.20.0.0/16 where the VPC CIDR would overlap, so the address
+    differs between clusters even when the Service exists.
+
+    The agent-cluster Terraform module also exposes coredns_cluster_ip_hint. It is a hint and named
+    one: it is empty on a cluster with no kube-dns Service.
+    */}}
+    - name: allow-dns
+      action: Accept
+      to:
+        - networks:
+            {{- range .Values.networkPolicy.dnsDestinations }}
+            - {{ . | quote }}
+            {{- end }}
+      ports:
+        - portNumber:
+            protocol: UDP
+            port: 53
+        - portNumber:
+            protocol: TCP
+            port: 53
+---
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ClusterNetworkPolicy
+metadata:
+  # Named for what it holds, not for the gateway: in the base it holds the bedrock-runtime rule,
+  # with no gateway, and it always holds the checkpoint, OIDC and memory destinations too.
+  name: eks-agents-approved-destinations
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  tier: Admin
+  priority: 30
+
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Values.namespaces.reasoning }}
+
+  egress:
+    {{- if not .Values.gateway.enabled }}
+    {{/*
+    NO GATEWAY. The one permitted model destination becomes Amazon Bedrock itself, reached with the
+    agent's own Pod Identity credential, so this rule is what replaces allow-egress-gateway.
+
+    This is the shape the boundary takes without the second layer, and it is worth seeing what it
+    costs: the list is not one entry that a policy engine sits behind. It is one entry PER
+    PROVIDER ENDPOINT the agent calls, each one a decision somebody reviews, and nothing in the path
+    can see the request -- no token budget, no model failover, no per-call audit, and the agent holds
+    its own credential. The agents page of the EKS User Guide compares the two.
+
+    bedrock-runtime, not bedrock: the data-plane host serves InvokeModel and Converse. The control
+    plane (ListFoundationModels and friends) is a different host, and an agent does not need it.
+    */}}
+    - name: allow-egress-bedrock
+      action: Accept
+      to:
+        - domainNames:
+            - {{ printf "bedrock-runtime.%s.%s" .Values.region (ternary "amazonaws.com.cn" "amazonaws.com" (eq .Values.partition "aws-cn")) | quote }}
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 443
+    {{- else if eq .Values.path "open-source" }}
+    {{/*
+    The gateway, named as a namespace. Everything an agent reaches outside the cluster goes through
+    it, so this one rule replaces the list of approved destinations a base-layer stack would have to
+    maintain.
+    */}}
+    - name: allow-egress-gateway
+      action: Accept
+      to:
+        - namespaces:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.gateway.namespace }}
+    {{- else }}
+    {{- if not .Values.gateway.hostname }}
+    {{ fail "gateway.hostname is required on the aws-services path: it is the single destination this policy accepts, and without it the rendered policy would permit nothing and every agent would fail at its first call. Take the value from the gateway_hostname Terraform output." }}
+    {{- end }}
+    {{/*
+    The managed gateway, by hostname.
+
+    Cluster-scoped hostname pinning, which the shipped CRD supports: egress `to` peers accept
+    domainNames alongside namespaces, pods and networks. So this path's boundary is as strong as the
+    open source path's — one destination, in a tier no tenant can edit — rather than having to fall
+    back to a namespaced policy where RBAC becomes part of the boundary.
+
+    The rule resolves by name rather than by address, and enforcement follows the resolved IPs with
+    their TTL, so a change of address behind the name neither opens a hole nor closes one.
+    */}}
+    - name: allow-egress-gateway
+      action: Accept
+      to:
+        - domainNames:
+            - {{ .Values.gateway.hostname | quote }}
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 443
+    {{- end }}
+
+    {{/*
+    The EKS Pod Identity credential endpoint. Without this an agent's request for its AWS
+    credentials times out, from a sandboxed pod as from an ordinary one, and the symptom is an agent
+    that cannot reach a model with a role that permits it.
+
+    Note what this is not. It is not the agent holding AWS credentials "outside" the stack. An agent
+    that uses EKS Pod Identity necessarily has AWS credentials available in its pod, because that
+    is what the association delivers. "No credentials in the pod"
+    is true of third-party secrets, not of everything.
+    */}}
+    {{- if .Values.storage.checkpointBucket }}
+    {{/*
+    S3 for the checkpoint bucket, and STS so a credential can be resolved at all.
+
+    REACHING THE CREDENTIAL ENDPOINT IS NOT REACHING AWS. The Pod Identity endpoint at
+    169.254.170.23 is permitted below, so an agent can obtain a session -- and without these rules
+    there is nothing it can spend that session on: sts and s3 both time out while the credential
+    endpoint answers.
+
+    THE BUCKET'S OWN HOST, NOT THE REGIONAL ONE. S3 uses virtual-hosted-style addressing, so a
+    request for this bucket goes to <bucket>.s3.<region>.amazonaws.com; a rule naming only the
+    regional endpoint matches nothing and the call hangs. The regional host s3.<region>.amazonaws.com
+    is not named, because it is a route to EVERY bucket: path-style requests to any bucket go to it,
+    and the agent's IAM role limits only what the agent's own credentials may do -- not an anonymous
+    request, or a presigned URL someone else signed. The agent's session store (S3SessionManager,
+    virtual-hosted) reaches its bucket without it.
+
+    A VPC endpoint does not remove the need for these rules; it only changes what the name resolves
+    to.
+    */}}
+    - name: allow-checkpoint-storage
+      action: Accept
+      to:
+        - domainNames:
+            - "{{ .Values.storage.checkpointBucket }}.s3.{{ .Values.region }}.amazonaws.com"
+            - "sts.{{ .Values.region }}.amazonaws.com"
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 443
+    {{- end }}
+
+    {{- if (.Values.tasks | default dict).enabled }}
+    {{/*
+    Agents that run as tasks: SQS, where a task pod takes its message and sends its answer. The
+    agent's role reaches only its own two queues (the tasks-<agent> permission set).
+    */}}
+    - name: allow-task-queues
+      action: Accept
+      to:
+        - domainNames:
+            - "sqs.{{ .Values.region }}.amazonaws.com"
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 443
+    {{- end }}
+
+    {{- if and (.Values.personAccess | default dict).enabled (not ((.Values.personAccess.viaGateway | default dict).enabled)) }}
+    {{/*
+    NOT RENDERED with person_access_via_gateway: the gateway then makes every person-data call, so
+    an agent has no route to STS or the bucket of its own, and the gateway is its only egress.
+
+    Acting with a person's own authority: STS, where the person's ID token is exchanged
+    (AssumeRoleWithWebIdentity, unsigned -- the agent's own role is not used), and the person-data
+    bucket by its own host, for the same reason as the checkpoint bucket above.
+    */}}
+    - name: allow-person-access
+      action: Accept
+      to:
+        - domainNames:
+            - "{{ .Values.personAccess.bucket }}.s3.{{ .Values.region }}.amazonaws.com"
+            - "sts.{{ .Values.region }}.amazonaws.com"
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 443
+    {{- end }}
+
+    {{- range .Values.networkPolicy.awsServiceEndpoints }}
+    {{/*
+    An AWS service endpoint the agent calls with its own credentials.
+
+    REACHING THE CREDENTIAL ENDPOINT IS NOT THE SAME AS REACHING AWS. The Pod Identity endpoint at
+    169.254.170.23 is permitted below, so an agent can obtain credentials -- and without a rule
+    naming the service it cannot use them for anything: the call times out while the credential
+    endpoint answers, so an agent holds a session it cannot spend.
+
+    The checkpoint bucket has its own rule above; list here any other service an agent calls
+    directly. A VPC endpoint does not remove the need for the rule, it only changes which address
+    the name resolves to.
+    */}}
+    - name: allow-aws-{{ .name }}
+      action: Accept
+      to:
+        - domainNames:
+            {{- range .hosts }}
+            - {{ . | quote }}
+            {{- end }}
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 443
+    {{- end }}
+
+    {{- range .Values.networkPolicy.inClusterDestinations }}
+    {{/*
+    An in-cluster destination the agent needs, named as a namespace and a port list.
+    
+    Anything in the cluster an agent talks to has to be named here -- there is no implicit
+    east-west allowance, and a destination left out fails as a timeout to a name that resolves.
+    */}}
+    - name: allow-{{ .name }}
+      action: Accept
+      to:
+        - namespaces:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace }}
+      ports:
+        {{- range .ports }}
+        - portNumber:
+            protocol: TCP
+            port: {{ . }}
+        {{- end }}
+    {{- end }}
+
+    {{- if and .Values.networkPolicy.allowOidcIssuer .Values.oidcIssuerUrl }}
+    {{/*
+    The cluster's own OIDC issuer.
+
+    INBOUND AUTH NEEDS OUTBOUND REACHABILITY, which is the part that surprises. A workload that
+    verifies a caller's JWT has to fetch the issuer's signing keys, and the EKS issuer is a public
+    hostname -- so without this rule the verification fails closed and every authenticated request
+    is refused with 401. The workload's own log says so and nothing else does:
+
+      refused a request: cannot read OIDC discovery at https://oidc.eks.<region>.amazonaws.com/... :
+      <urlopen error timed out>
+
+    The agent's HTTP server, the MCP server and the chat UI all verify tokens this way, so all three
+    need it.
+
+    The hostname is derived from oidcIssuerUrl so it cannot drift from the issuer the workloads are
+    configured with.
+    */}}
+    - name: allow-cluster-oidc-issuer
+      action: Accept
+      to:
+        - domainNames:
+            - {{ (urlParse .Values.oidcIssuerUrl).host | quote }}
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 443
+    {{- end }}
+
+    {{- if .Values.networkPolicy.allowSameNamespace }}
+    {{/*
+    Other pods in the same namespace: the chat UI calling an agent, and an agent its own Service.
+
+    The ingress rules below accept the reasoning namespace, which is only half of it: a connection
+    needs an egress allow at the source as well, and this policy's reachable set is exactly what it
+    names. Without this rule the chat UI cannot reach an agent, nor an agent its own Service, and
+    the symptom is ConnectTimeout to a name that resolves: a pod cannot reach its own Service DNS
+    while ingress says it can.
+
+    Set networkPolicy.allowSameNamespace to false where nothing in the namespace calls an agent
+    there, and the namespace stops being reachable from itself.
+    */}}
+    - name: allow-same-namespace-egress
+      action: Accept
+      to:
+        - namespaces:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.namespaces.reasoning }}
+    {{- end }}
+
+    {{- if and .Values.observability.enabled .Values.observability.collectorNamespace }}
+    {{/*
+    The telemetry collector, named as a namespace. Only when one is installed (observability.enabled).
+
+    WITHOUT THIS THE AGENT EMITS NOTHING. The rules in this policy are the agent's whole reachable
+    set, and the collector is not the gateway -- so OTLP export times out, every span and metric is
+    dropped, and the dashboards stay empty while the agent, the collector, Prometheus and Grafana
+    all report healthy. Without this rule a socket to opentelemetry-collector.monitoring:4318 from
+    an agent pod times out.
+
+    This is east-west traffic inside the cluster, not egress from it, which is why a namespace peer
+    is the right shape and no hostname is involved.
+    */}}
+    - name: allow-telemetry-collector
+      action: Accept
+      to:
+        - namespaces:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.observability.collectorNamespace }}
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 4317
+        - portNumber:
+            protocol: TCP
+            port: 4318
+    {{- end }}
+
+    {{- if .Values.networkPolicy.adminTierDefaultDeny }}
+    {{/*
+    Destinations otherwise admitted below the Admin tier, named here so the Deny after this policy does
+    not cut them: the memory ladder's off-cluster endpoints, and the ALB signing-key host the chat UI
+    verifies x-amzn-oidc-data against.
+    */}}
+    {{- $hosts := list }}
+    {{- if and (ne .Values.path "open-source") .Values.memory.sessionStateEndpoint }}
+    {{- $ss := .Values.memory.sessionStateEndpoint }}
+    {{- if kindIs "slice" $ss }}{{ $f := index $ss 0 }}{{ $ss = printf "%s:%v" $f.address $f.port }}{{ end }}
+    - name: allow-session-state
+      action: Accept
+      to:
+        - domainNames:
+            - {{ index (splitList ":" $ss) 0 | quote }}
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: {{ $p := splitList ":" $ss }}{{ if gt (len $p) 1 }}{{ index $p 1 }}{{ else }}6379{{ end }}
+    {{- end }}
+    {{- if .Values.memory.vectorBucketArn }}{{ $hosts = append $hosts (printf "s3vectors.%s.api.aws" .Values.region) }}{{ end }}
+    {{- if or .Values.memory.memoryId (and (.Values.personAccess | default dict).enabled (eq (((.Values.personAccess | default dict).tokenExchange | default dict).mode | default "") "agentcore")) }}{{ $hosts = append $hosts (printf "bedrock-agentcore.%s.amazonaws.com" .Values.region) }}{{ end }}
+    {{- if .Values.memory.consolidation.dbSecretArn }}{{ $hosts = append $hosts (printf "secretsmanager.%s.amazonaws.com" .Values.region) }}{{ end }}
+    {{- if .Values.chatUi.enabled }}{{ $hosts = append $hosts (printf "public-keys.auth.elb.%s.amazonaws.com" .Values.region) }}{{ end }}
+    {{- if $hosts }}
+    - name: allow-below-tier-destinations
+      action: Accept
+      to:
+        - domainNames:
+            {{- range $hosts }}
+            - {{ . | quote }}
+            {{- end }}
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 443
+    {{- end }}
+    {{- end }}
+
+    - name: allow-pod-identity
+      action: Accept
+      to:
+        - networks:
+            - 169.254.170.23/32
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 80
+
+  ingress:
+    {{/*
+    NO HEALTH-PROBE RULE HERE, and it cannot go here.
+
+    ClusterNetworkPolicy ingress peers are namespaces and pods only -- there is no networks/CIDR
+    peer on ingress, though egress has one. Read from the CRD:
+
+      kubectl explain clusternetworkpolicy.spec.ingress.from
+
+    The kubelet is not a pod in a namespace, so it cannot be named by either peer type. The probe
+    rule therefore lives in the namespaced ApplicationNetworkPolicy in
+    31-namespaced-egress-policy.yaml, whose ipBlock peer can express a CIDR.
+    */}}
+    {{/*
+    Reaching an agent is a separate path from an agent reaching out, and it arrives through the load
+    balancer rather than from another namespace. Accept the reasoning namespace itself, for
+    the chat UI and other callers there, and leave everything else to the default deny.
+    */}}
+    - name: allow-same-namespace
+      action: Accept
+      from:
+        - namespaces:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.namespaces.reasoning }}
+---
+{{- if .Values.networkPolicy.adminTierDefaultDeny }}
+{{/*
+THE ADMIN TIER'S LAST WORD, opt-in (networkPolicy.adminTierDefaultDeny). Without it a destination
+the policies above do not name falls through to the namespaced and per-agent policies, which a
+tenant with RBAC in the namespace can edit. Priority 40, after eks-agents-approved-destinations, so every
+Accept above is evaluated first. Not covered by the Accepts, and so cut by this: anything a
+hand-written workload in the namespace reaches. The Kubernetes API for an Agent with needsClusterApi
+and the MCP servers for an Agent with mcpAudience are the exceptions, accepted just below at
+priorities 35 and 36.
+*/}}
+{{- if .Values.networkPolicy.kubernetesApiServiceIp }}
+{{/*
+THE KUBERNETES API, for the pods of an Agent with needsClusterApi, which carry
+eks-agents/cluster-api: "true" (_agent-pod.tpl). Without it the deny below cuts the API even though
+the agent's own policy (40-agent-rgd.yaml, clusterApiPolicy) admits it. Under the Admin deny-all at
+priority 40, this Accept admits the labelled pod to the Service ClusterIP and leaves an unlabelled
+pod in the same namespace refused.
+
+The label is set by the Agent's composition, but nothing stops a pod written by hand in the
+namespace from carrying it; what that buys is a connection to the API server, where the pod still
+needs a token the API accepts.
+*/}}
+---
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ClusterNetworkPolicy
+metadata:
+  name: eks-agents-cluster-api
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  tier: Admin
+  priority: 35
+  subject:
+    pods:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.namespaces.reasoning }}
+      podSelector:
+        matchLabels:
+          eks-agents/cluster-api: "true"
+  egress:
+    - name: allow-kubernetes-api
+      action: Accept
+      to:
+        - networks:
+            - {{ printf "%s/32" .Values.networkPolicy.kubernetesApiServiceIp }}
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: 443
+---
+{{- end }}
+{{/*
+THE MCP SERVERS' NAMESPACE, for the pods of an Agent with mcpAudience, which carry
+eks-agents/mcp-client: "true" (_agent-pod.tpl). Such an agent calls the MCP server directly with a
+token minted for the server (aws-services, where AgentCore Gateway cannot reach a ClusterIP
+Service), and its own policy (40-agent-rgd.yaml, mcpPolicy) admits the namespace; without this the
+deny below cuts it anyway, and the agent's connection to mcp-server.mcp-servers:8080 times out even
+though its -mcp policy names the namespace. The server's token check is the access
+control; this only gets the packets there, as for the Kubernetes API above.
+*/}}
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ClusterNetworkPolicy
+metadata:
+  name: eks-agents-mcp-servers
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  tier: Admin
+  priority: 36
+  subject:
+    pods:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.namespaces.reasoning }}
+      podSelector:
+        matchLabels:
+          eks-agents/mcp-client: "true"
+  egress:
+    - name: allow-mcp-servers
+      action: Accept
+      to:
+        - namespaces:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.mcpServers.namespace | quote }}
+      ports:
+        - portNumber:
+            protocol: TCP
+            port: {{ .Values.networkPolicy.mcpServers.port }}
+---
+apiVersion: networking.k8s.aws/v1alpha1
+kind: ClusterNetworkPolicy
+metadata:
+  name: eks-agents-reasoning-default-deny
+  annotations:
+    argocd.argoproj.io/sync-options: PruneLast=true
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  tier: Admin
+  priority: 40
+  subject:
+    namespaces:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Values.namespaces.reasoning }}
+  egress:
+    - name: deny-all-other-egress
+      action: Deny
+      to:
+        - networks:
+            - 0.0.0.0/0
+{{- end }}
+{{- end }}

@@ -1,0 +1,25 @@
+# The istio-system Namespace, synced by the istio-namespace Application (../54-istio-namespace.yaml).
+# Why it is created ahead of the Istio Applications at all is in that file's header.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system
+  annotations:
+    # Never pruned by a sync, the root's included, so no sync with --prune can delete it with the
+    # mesh in it.
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app.kubernetes.io/managed-by: argocd
+
+    # NOT an agent namespace: no eks-agents/admission label, so the sandbox rule does not bind here.
+    # istiod and ztunnel are platform components and are not sandboxed; ztunnel in particular needs
+    # the host network path it would be denied.
+    #
+    # privileged, and deliberately. istio-cni writes iptables rules through a host mount and ztunnel
+    # runs with NET_ADMIN; both are refused under `restricted` and the refusal is a pod that never
+    # starts. This is the namespace where that exemption lives, which is why agents never run in it.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged

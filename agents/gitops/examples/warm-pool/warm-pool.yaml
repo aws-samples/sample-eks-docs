@@ -1,0 +1,161 @@
+# A warm pool of pre-booted sandboxes, and the claim that adopts one.
+#
+# What this is for. An isolated runtime introduces a startup cost, and an agent that is slow to
+# initialize repeats it on every cold start. A warm pool holds pre-booted guests so a claim is
+# adopted in about a second rather than paying for sandbox creation and an image pull.
+#
+# When it earns its place: interactive or bursty agents that idle between turns, and agents whose
+# initialization is expensive. When it does not: stateless request-and-response agents, which a
+# standard Deployment under the sandbox runtime class serves more simply — that is what the Agent
+# resource in gitops/base produces, and it is the right default.
+#
+# Needs the agent-sandbox controller from gitops/platform/*/40-agent-sandbox.yaml, with extensions
+# enabled. SandboxTemplate, SandboxWarmPool and SandboxClaim are the extension API; the core Sandbox
+# CRD alone does not carry them.
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: execution
+  namespace: agents-execution
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    eks-agents/tier: execution
+spec:
+  # Unmanaged, deliberately.
+  #
+  # Left at the default, Managed, the controller adds a network policy of its own — and with no rules
+  # supplied, that policy allows 0.0.0.0/0 less the private ranges: the public internet. It is inert
+  # against a pod that has no network device, and it would become the standing permission the moment
+  # anyone dropped the annotation below.
+  #
+  # Saying Unmanaged instead means the only reason these pods cannot reach the network is that they
+  # have no network, plus the deny-all ApplicationNetworkPolicy from gitops/base, which a controller
+  # does not overwrite.
+  networkPolicyManagement: Unmanaged
+
+  # Let a claim bring its own workspace volume. The default is Disallowed, and a claim that
+  # supplies volumeClaimTemplates against a Disallowed template is REJECTED -- so without this
+  # line the per-session workspace in claim.yaml cannot be created, and with it the pool's own warm
+  # pods stay stateless and cheap.
+  #
+  # That split is the point. A volume on the TEMPLATE would provision an EBS volume per idle warm
+  # pod, which is a standing cost for storage nobody is using yet. A volume on the CLAIM is created
+  # when a session starts and is what survives suspend and resume.
+  #
+  # Allowed, not Overrides: a claim may add a workspace, and cannot redefine one the platform team
+  # declared.
+  volumeClaimTemplatesPolicy: Allowed
+
+  podTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: eks-agents-paved-paths
+        eks-agents-ai-docs: "true"
+        eks-agents/tier: execution
+
+      annotations:
+        # No network besides loopback. kubectl exec, cp and logs still work, over the sandbox's
+        # internal control channel, which is how the reasoning tier drives a claimed pod.
+        sandbox.amazonaws.com/network-isolated: "true"
+
+        # Pin the node while a warm pod sits Ready and idle in the pool.
+        #
+        # This one is easy to leave out and expensive to leave out. Nothing would reschedule a
+        # pre-booted warm pod if voluntary disruption — consolidation, drift, expiry — removed the
+        # node under it, so without this the pool silently empties and every claim pays the cold
+        # start the pool exists to avoid.
+        karpenter.sh/do-not-disrupt: "true"
+
+    spec:
+      runtimeClassName: isolated-sandbox
+      # ON THE AGENTS' OWN POOL, like every Agent (gitops/base/templates/_agent-pod.tpl), so the pod
+      # runs on a node in strict network policy mode rather than on a general-purpose node in
+      # standard mode.
+      nodeSelector:
+        karpenter.sh/nodepool: eks-agents
+      tolerations:
+        - {key: eks-agents/dedicated, operator: Equal, value: "true", effect: NoSchedule}
+
+      # A pod built from a SandboxTemplate has this defaulted to false already. Saying it out loud
+      # records what the pod relies on rather than changing it: these pods run whatever the model
+      # decided to run and hold no token for the cluster.
+      automountServiceAccountToken: false
+
+      enableServiceLinks: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+
+        # Without this the session's workspace mounts and is NOT WRITABLE: the EBS volume
+        # arrives as `/dev/vdd on /workspace type ext4` owned by root, the container runs as 10001,
+        # and the first write fails with "Permission denied" -- a session workspace the agent cannot
+        # write to, with the mount looking perfectly healthy.
+        #
+        # fsGroup makes the kubelet chown the volume's root to this group on mount. It applies only
+        # to the volume, so it changes nothing for a pod that binds no volume -- which is why it is
+        # safe to set on the template that the stateless warm pods are also built from.
+        fsGroup: 10001
+
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: execution
+          image: public.ecr.aws/docker/library/python:3.13-slim
+          imagePullPolicy: IfNotPresent
+
+          command: ["sh", "-c"]
+          args:
+            - |
+              echo "warm sandbox ready: kernel $(uname -rv)"
+              exec sleep infinity
+
+          workingDir: /workspace
+
+          resources:
+            requests:
+              # The sandbox is sized from these at boot, and sandbox memory is fixed after boot —
+              # there is no resizing a warm guest to fit a larger task later. So size the pool for
+              # the largest task it will serve, not the average one.
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+
+      volumes:
+        - name: workspace
+          emptyDir: {}
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: execution-pool
+  namespace: agents-execution
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+spec:
+  # Pods held booted and waiting. A claim adopts one and the pool boots a replacement, so while N
+  # sessions hold pods the steady state is N + replicas.
+  #
+  # This is a standing cost: these guests consume CPU and memory while idle, so a large pool is a
+  # real number of instances.
+  # Size it from the concurrency the platform actually sees, and treat it as a dial rather than a
+  # setting.
+  replicas: 3
+
+  sandboxTemplateRef:
+    name: execution

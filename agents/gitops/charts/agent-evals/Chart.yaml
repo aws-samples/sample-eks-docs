@@ -1,0 +1,16 @@
+apiVersion: v2
+name: agent-evals
+description: >-
+  Agent evaluation on both paths, with Strands Evals. One runner image grades sampled live
+  sessions (open source: from Langfuse, scores written back to Langfuse) and runs declared test
+  cases against deployed agents as a release gate (both paths; on AWS the results land in
+  AgentCore Evaluations' result log group and its CloudWatch dashboard). The judge is reached
+  through the stack's own gateway on the runner's projected service account token, so it holds no
+  model credential and its spend lands at the same budget and audit point as the agents' own calls.
+type: application
+
+version: 0.1.0
+appVersion: "0.1.0"
+
+annotations:
+  eks-agents/paved-path: both

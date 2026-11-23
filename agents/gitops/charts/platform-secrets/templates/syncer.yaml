@@ -1,0 +1,111 @@
+{{- if .Values.platformSecrets.enabled }}
+{{- range $ns := .Values.platformSecrets.namespaces }}
+{{- $mounted := list }}
+{{- range $name, $spec := $.Values.platformSecrets.secrets }}
+{{- if and $spec.secretsManagerName (eq $spec.namespace $ns) }}
+{{- $mounted = append $mounted $name }}
+{{- end }}
+{{- end }}
+{{- if $mounted }}
+---
+# The service account the CSI provider reads Secrets Manager as. Terraform creates one Pod Identity
+# association per namespace against this name, scoped to only that namespace's secrets.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $.Values.platformSecrets.serviceAccountName }}
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+---
+# THE POD THAT HOLDS THE MOUNT OPEN, and the only reason it exists.
+#
+# A synced Secret is owned by the pod that mounts its SecretProviderClass: no mount, no Secret.
+# The consumers here are third-party charts that read `existingSecret` and never mount anything, so
+# something has to keep the volume mounted for the Secret to keep existing. This is that something.
+#
+# It runs pause: no application, no network, nothing to patch. The CSI driver does the work at mount
+# time and this pod simply stays alive.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-secrets-syncer
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+    app.kubernetes.io/name: platform-secrets-syncer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform-secrets-syncer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform-secrets-syncer
+      # A NEW POD WHEN A VALUE CHANGES. The CSI driver writes the synced Secret when the volume is
+      # mounted, so a value rotated in Secrets Manager reaches Kubernetes only through a new mount --
+      # either the driver's rotation poll, where it is on, or a new pod. This hash of the Secrets
+      # Manager versions this pod mounts comes from terraform-values.yaml, so `terraform apply` and a
+      # commit roll the syncer with no kubectl. Consumers that read a Secret only at start-up still
+      # need their own restart.
+      annotations:
+        eks-agents/secret-versions: {{ $versions := list }}{{ range $name := $mounted }}{{ $versions = append $versions (printf "%s=%s" $name ((index $.Values.platformSecrets.secrets $name).version | default "")) }}{{ end }}{{ $versions | join "," | sha256sum | trunc 16 | quote }}
+    spec:
+      serviceAccountName: {{ $.Values.platformSecrets.serviceAccountName }}
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pause
+          image: {{ $.Values.platformSecrets.pauseImage }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            {{- range $name := $mounted }}
+            - name: {{ $name }}
+              mountPath: /mnt/{{ $name }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        {{- range $name := $mounted }}
+        - name: {{ $name }}
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ $name }}
+        {{- end }}
+---
+# A Secret disappearing because its holder was evicted is the failure mode of this design, so the
+# holder is protected from voluntary disruption. maxUnavailable rather than minAvailable, with
+# AlwaysAllow: a single-replica PDB with minAvailable 1 reports disruptionsAllowed 0 and blocks node
+# repair outright, which is a worse outcome than a brief gap.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: platform-secrets-syncer
+  namespace: {{ $ns }}
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: platform-secrets-syncer
+{{- end }}
+{{- end }}
+{{- end }}

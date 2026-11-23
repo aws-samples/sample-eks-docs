@@ -1,0 +1,72 @@
+{{- if not (has "52-agent-evals.yaml" .Values.excluded) }}
+# Agent evaluation on the open source path: Strands Evals, grading sessions from Langfuse and writing
+# the grades back to Langfuse as session scores, with the judge reached through the in-cluster gateway.
+#
+# SYNCED ONLY WITH enable_evaluations = true. The platform chart's excluded list leaves this file out
+# otherwise, and the same variable creates what the runner needs outside the cluster:
+# the judge's IAM role, its gateway route (rendered into agentgateway-config), and the Langfuse
+# project keys copied into the runner's namespace.
+#
+# IT NEEDS LANGFUSE: enable_langfuse, which Terraform requires alongside enable_evaluations. That one
+# variable syncs 51-langfuse.yaml and points the collector's traces at it. The cases and the image
+# tag are in agent-evals-values.yaml beside the platform chart.
+#
+# A runner rather than Langfuse-native evaluators: those call the judge from inside Langfuse over a
+# static key, which the gateway refuses.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agent-evals
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: eks-agents-paved-paths
+    eks-agents-ai-docs: "true"
+  annotations:
+    # After the base chart, which creates the runner's namespace and admits it on each agent's
+    # network policy, and after the trace backend it reads.
+    argocd.argoproj.io/sync-wave: "4"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: eks-agents
+
+  source:
+    repoURL: {{ .Values.repo.url }}
+    targetRevision: {{ .Values.repo.revision }}
+    path: {{ .Values.repo.path }}gitops/charts/agent-evals
+
+    helm:
+      valueFiles:
+        - values.yaml
+        # What the platform team declares: the release gate's cases, the runner image tag, and any
+        # override of the chart's defaults. Last, so it wins.
+      # ignoreMissingValueFiles stays at its default, false, so a missing values file fails the
+      # render. Not written out: the EKS Argo CD capability rewrites Application objects and drops
+      # a false field, so the root Application would compare Git's false with nothing and stay
+      # OutOfSync.
+      # The rendered values (terraform, agentEvals), passed by the root Application.
+      values: |
+        {{- toYaml (mergeOverwrite (deepCopy .Values.terraform) (deepCopy .Values.agentEvals)) | nindent 8 }}
+  destination:
+    name: eks-agents
+    namespace: agent-evals
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    # LONGER THAN THE SHORT BACKOFF every other Application carries (5 s, x2, cap 30 s), on purpose:
+    # its namespace comes from eks-agents-base (00-namespaces.yaml) and a sync wave
+    # does not wait for another Application to be healthy. On a fresh cluster the base chart can
+    # sync many minutes after Istio; this Application's first sync then fails with `namespaces
+    # "agent-evals" not found`, and Argo CD does not re-run a failed sync of the same revision on
+    # its own -- it stays failed until synced by hand. ~40 minutes of backoff.
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
+    syncOptions:
+      - ServerSideApply=true
+{{- end }}
