@@ -4,12 +4,15 @@ Reference code for the [Amazon EKS User Guide](https://docs.aws.amazon.com/eks/l
 
 The samples are written to be read as well as run. Each one shows a working way to set up a pattern on Amazon EKS, with its defaults and trade-offs called out, so you can adapt it to your own environment.
 
+> [!IMPORTANT]
+> These samples are references, not production-ready deployments. Before you run any of them in production, test them in a non-production account and adapt them to your environment's security, availability, and cost requirements.
+
 ## Contents
 
 | Section | What it covers | User Guide section |
 | --- | --- | --- |
 | [AI/ML on EKS](ai-ml/) | GPU-ready clusters, model serving, shared storage and GPU health testing | [AI/ML on Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/ml-on-eks.html) |
-| [AI agents on EKS](agents/) | An agent platform on EKS Auto Mode, on an open source path or an AWS services path: Nitro Sandbox isolation, network policy, an egress gateway, a per-agent identity, and the layers each page turns on | [AI agents on Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/agents.html) |
+| [AI agents on EKS](agents/) | Agents on EKS, on an open source path or an AWS services path: Nitro Sandbox isolation, network policy, an egress gateway, a per-agent identity, and the layers each page turns on | [AI agents on Amazon EKS](https://docs.aws.amazon.com/eks/latest/userguide/agents.html) |
 
 ## Repository layout
 
