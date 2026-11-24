@@ -1,22 +1,22 @@
 # GitOps
 
-Every Kubernetes object the platform installs, delivered by Argo CD. Read this to find where a component is defined and how it reaches the cluster; anything that's an AWS API call is in [`terraform/`](../terraform) instead.
+This directory holds every Kubernetes object that the stack installs, and Argo CD delivers them. Use this README to find where a component is defined and how it reaches the cluster. Everything that's an AWS API call is in [`terraform/`](../terraform).
 
-Argo CD is the EKS Capability for Argo CD, which runs off-cluster, so every Application names the destination `eks-agents` that [`bootstrap/<path>/cluster-secret.yaml`](bootstrap/aws-services/cluster-secret.yaml) registers. Terraform writes `platform/<path>/terraform-values.yaml`, and every chart here reads it as a second Helm values file, so no account ID, ARN, or endpoint is copied into a manifest by hand.
+Argo CD runs as the EKS Capability for Argo CD, outside the cluster, so every Application names the destination `eks-agents` that [`bootstrap/<path>/cluster-secret.yaml`](bootstrap/aws-services/cluster-secret.yaml) registers. Terraform writes `platform/<path>/terraform-values.yaml`, and every chart here reads it as a second Helm values file, so you don't copy an account ID, ARN, or endpoint into a manifest by hand.
 
 ## Layout
 
 | Directory | Contents | Applied by |
 |---|---|---|
 | [`bootstrap/aws-services/`](bootstrap/aws-services), [`bootstrap/open-source/`](bootstrap/open-source) | The cluster secret, the AppProject, and the root Application | `scripts/bootstrap-gitops.sh` |
-| [`platform/aws-services/`](platform/aws-services), [`platform/open-source/`](platform/open-source) | One file per platform component, each holding one or more Argo CD Applications | The root Application |
+| [`platform/aws-services/`](platform/aws-services), [`platform/open-source/`](platform/open-source) | The root chart for each path, with one file per component, each holding one or more Argo CD Applications | The root Application |
 | [`base/`](base) | The chart for cluster-wide controls and the `Agent` resource definition | The `eks-agents-base` Application |
-| [`charts/`](charts) | Charts for components with no usable upstream chart | Platform Applications |
+| [`charts/`](charts) | Charts for components with no usable upstream chart | The component Applications |
 | [`examples/`](examples) | Agents and shapes you apply yourself | You |
 
 ## Bootstrap and sync
 
-`scripts/bootstrap-gitops.sh --path <path>` applies the cluster secret, the AppProject, and the root Application, in that order, from the `*.local.yaml` files `terraform apply` rendered. The root Application has no automated sync, so every change to the component set is a sync you start:
+`scripts/bootstrap-gitops.sh --path <path>` applies the cluster secret, the AppProject, and the root Application, in that order, from the `*.local.yaml` files that `terraform apply` rendered. The root Application has no automated sync, so you start a sync for every change to the set of components.
 
 | Flag | Effect |
 |---|---|
@@ -27,9 +27,9 @@ Argo CD is the EKS Capability for Argo CD, which runs off-cluster, so every Appl
 
 ## How components are turned on and off
 
-Terraform renders the root Application's `exclude` glob from your variables, and a file in the glob isn't synced. Each path's README maps every file to the variable that gates it: [aws-services](platform/aws-services/README.md), [open-source](platform/open-source/README.md). The root Application doesn't recurse, so `platform/open-source/alternatives/` is never synced.
+Terraform renders the root Application's `exclude` glob from your variables, and Argo CD doesn't sync a file that the glob matches. The README for each path, [aws-services](platform/aws-services/README.md) and [open-source](platform/open-source/README.md), maps every file to the variable that turns it on. The root Application doesn't recurse, so `platform/open-source/alternatives/` is never synced.
 
-Applications that install CRDs sync with `prune: false`, because pruning a CRD deletes every resource of that kind. A resource you remove from one of their manifests stays on the cluster until you delete it.
+Applications that install CRDs sync with `prune: false`, because pruning a CRD deletes every resource of that kind. A resource that you remove from one of their manifests stays on the cluster until you delete it.
 
 ## Charts
 
@@ -45,8 +45,8 @@ Applications that install CRDs sync with `prune: false`, because pruning a CRD d
 
 ## Examples
 
-[`examples/`](examples) holds seven shapes you apply yourself, each with a README that says what it demonstrates and what it costs. They're outside `platform/` so nothing reaches a cluster unless you choose it. Start with [`reasoning-execution-split/`](examples/reasoning-execution-split), the two-tier agent whose execution tier has no network.
+[`examples/`](examples) holds seven shapes that you apply yourself, each with a README that says what it demonstrates and what it costs. They're outside `platform/`, so none of them reaches a cluster unless you apply it. Start with [`reasoning-execution-split/`](examples/reasoning-execution-split), the two-tier agent whose execution tier has no network device.
 
 ## Before you change anything here
 
-Run `scripts/validate.sh`. It renders every chart against both paths and checks the output for placeholders, missing guards, and broken references, with no cluster or AWS account. `scripts/exercise.sh` checks the same layers on a live cluster.
+Run `scripts/validate.sh`. It renders every chart against both paths and checks the output for placeholders, missing guards, and broken references, without a cluster or an AWS account. `scripts/exercise.sh` checks the same layers on a live cluster.
