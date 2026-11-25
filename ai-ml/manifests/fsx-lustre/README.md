@@ -11,7 +11,7 @@ FSx for Lustre can serve clients over two transports:
 - **TCP** - the standard path. The FSx CSI driver mounts the filesystem into pods over TCP. No node configuration required, and it's what **both variants** use out of the box. The provisioning and test steps on this page exercise this path.
 - **EFA (RDMA)** - higher bandwidth / lower latency, but the node must run the EFA-enabled Lustre client, installed by a `userData` bootstrap script. EKS Auto Mode manages node bootstrap and does not support `userData`, so the EFA-accelerated client is only available on the self-managed **Karpenter** variant, whose `EC2NodeClass` can carry that script.
 
-`EfaEnabled` is set on the filesystem regardless (it's required for PERSISTENT_2 with automatic metadata, and is harmless for the TCP path).
+`EfaEnabled` is set on the filesystem in both variants, so the same file system serves the Karpenter EFA path. EFA is supported on PERSISTENT_2 file systems with a metadata configuration, which this one has, and it can only be enabled at creation. TCP clients mount an EFA-enabled file system normally.
 
 > For the EFA (RDMA) path - the userData client install plus node-level verification that traffic actually rides EFA - see the Karpenter nodepool guide: [`../../set-up-cluster/terraform/karpenter/nodepools/b-200s-static-fsx/README.md`](../../set-up-cluster/terraform/karpenter/nodepools/b-200s-static-fsx/README.md).
 
@@ -23,7 +23,7 @@ A Lustre filesystem has three server-side components:
 - **OSS** (Object Storage Server) - serves file data.
 - **OST** (Object Storage Target) - the disk volume attached to an OSS. Files are **striped** across OSTs, so more OSTs = more parallel I/O paths = more throughput.
 
-On FSx PERSISTENT_2, FSx creates **1 OST per 2400 GiB** of capacity, and each OST does roughly 4-5 GiB/s. So **capacity determines the throughput ceiling**, and `per_unit_storage_throughput` (125/250/500/1000 MB/s/TiB) sets the per-TiB baseline. Aggregate baseline = `per_unit_storage_throughput x (storage_capacity / 1024)` MB/s. Example: 1000 MB/s/TiB over 4.8 TiB (the default) ≈ 4.7 GB/s baseline across 2 OSTs.
+On FSx PERSISTENT_2, FSx creates **1 OST per 2400 GiB** of capacity. So **capacity determines the throughput ceiling**, and `per_unit_storage_throughput` (125/250/500/1000 MB/s/TiB) sets the per-TiB baseline. Aggregate baseline = `per_unit_storage_throughput x (storage_capacity / 1024)` MB/s. Example: 1000 MB/s/TiB over 4.8 TiB (the default) ≈ 4.7 GB/s baseline across 2 OSTs (about 2.3 GB/s each).
 
 ## Prerequisites
 
@@ -49,6 +49,7 @@ export FSX_SUBNET_ID=$(aws ec2 describe-subnets \
  --filters "Name=tag:karpenter.sh/discovery,Values=ai-eks-docs" "Name=availability-zone,Values=us-east-2a" \
  --query 'Subnets[0].SubnetId' --output text)
 echo "FSx subnet: $FSX_SUBNET_ID"
+```
 
 Apply with `enable_fsx=true`. The default is the smallest EFA-enabled file system (4800 GiB) at the top throughput tier (1000 MB/s/TiB):
 

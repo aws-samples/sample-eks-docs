@@ -128,7 +128,7 @@ lsmod | grep -E 'lustre|nvidia_fs'
 
 [`fsx-efa-test.yaml`](../../../../../manifests/fsx-lustre/fsx-efa-test.yaml) runs a GPU pod on `gpu-static-fsx` that mounts `fsx-lustre-claim` and installs `fio`. The **CSI pod mount is over TCP** — the EFA transport is verified at the node level in step 5.
 
-Navigate to `manifests/fsx-luster/` directory
+Navigate to `manifests/fsx-lustre/` directory
 ```bash
 kubectl apply -f fsx-efa-test.yaml
 kubectl get pod fsx-efa-test          # expect Running
