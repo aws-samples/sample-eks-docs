@@ -150,7 +150,7 @@ kubectl get pods -n kube-system -l app=fsx-csi-controller
 kubectl describe pvc fsx-lustre-claim -n default
 ```
 
-**Pod stuck `ContainerCreating` / mount timeout.** Almost always the security group. FSx needs Lustre ports **988** and **1018-1023** reachable between the nodes and the filesystem. This cluster attaches the `shared` SG (which the filesystem also uses) to nodes, and its self-ingress rule is all-protocols (`-1`), so this is covered by default. If you changed the SG, re-add the rules:
+**Pod stuck `ContainerCreating` / mount timeout.** Almost always the security group. FSx needs Lustre ports **988** and **1018-1023** reachable between the nodes and the filesystem. This cluster attaches the `shared` SG (which the filesystem also uses) to nodes, and its self-ingress rule is all-protocols (`-1`), so this is covered by default. The EFA path on the Karpenter variant also needs the self-referencing egress rule on that SG (`shared_self` in `vpc.tf`): FSx doesn't accept CIDR-based rules such as `0.0.0.0/0` for EFA traffic, and without the rule Lustre traffic doesn't use EFA. If you changed the SG, re-add the rules:
 
 ```bash
 SG=$(aws ec2 describe-security-groups \
