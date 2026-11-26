@@ -47,8 +47,8 @@ variable "subnet_id" {
     EFA-accelerated Lustre client (RDMA transport) requires a userData bootstrap script to install
     the Lustre + EFA drivers, which Auto Mode does not support - so that acceleration is only
     available on the self-managed Karpenter variant. EfaEnabled is still set on the file system
-    (it is required for PERSISTENT_2 with the metadata configuration below and is harmless for the
-    TCP mount path), but Auto Mode clients will not use the EFA transport.
+    (EFA is supported on PERSISTENT_2 with the metadata configuration below, and TCP clients mount
+    an EFA-enabled file system normally), but Auto Mode clients will not use the EFA transport.
   EOT
   type        = string
   default     = ""
